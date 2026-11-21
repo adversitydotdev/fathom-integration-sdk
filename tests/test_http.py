@@ -38,8 +38,9 @@ def test_retries_honour_retry_after():
 )
 def test_status_mapping(status, error):
     http = Http(Script(*[Response(status, {}, b"")] * 4), sleep=lambda _: None)
-    with pytest.raises(error):
+    with pytest.raises(error) as caught:
         http.get("https://api.test/x?token=secret")
+    assert caught.value.status == status
 
 
 def test_exhausted_rate_limit_carries_retry_after_and_hides_the_query():

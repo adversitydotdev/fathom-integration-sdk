@@ -18,7 +18,13 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ogrl_integration import __version__
-from ogrl_integration.errors import AuthFailed, PermissionDenied, RateLimited, VendorError
+from ogrl_integration.errors import (
+    AuthFailed,
+    IntegrationError,
+    PermissionDenied,
+    RateLimited,
+    VendorError,
+)
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
@@ -149,13 +155,17 @@ class Http:
         if response.status < 400:
             return response
         where = f"{request.method} {_redact(request.url)} answered {response.status}"
+        error: IntegrationError
         if response.status == 401:
-            raise AuthFailed(where)
-        if response.status == 403:
-            raise PermissionDenied(where)
-        if response.status == 429:
-            raise RateLimited(where, _retry_after(response))
-        raise VendorError(where)
+            error = AuthFailed(where)
+        elif response.status == 403:
+            error = PermissionDenied(where)
+        elif response.status == 429:
+            error = RateLimited(where, _retry_after(response))
+        else:
+            error = VendorError(where)
+        error.status = response.status
+        raise error
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return self.request("GET", url, **kwargs)

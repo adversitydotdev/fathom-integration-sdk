@@ -3,6 +3,7 @@
 
 class IntegrationError(Exception):
     kind = "vendor_error"
+    status: int | None = None  # the HTTP status, when the client raised it
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
