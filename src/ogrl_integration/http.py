@@ -119,12 +119,14 @@ class Http:
         headers: Mapping[str, str] | None = None,
         json_body: Any = None,
         data: Mapping[str, str] | None = None,
+        content: bytes | None = None,
     ) -> Response:
+        """`content` sends bytes as they are, for callers that sign the body (AWS SigV4)."""
         if params:
             query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
             url = f"{url}{'&' if urllib.parse.urlsplit(url).query else '?'}{query}"
         sent = {"Accept": "application/json", **self.headers, **(headers or {})}
-        body = None
+        body = content
         if json_body is not None:
             body = json.dumps(json_body).encode()
             sent["Content-Type"] = "application/json"

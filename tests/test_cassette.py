@@ -32,3 +32,18 @@ def test_record_scrubs_then_replays(tmp_path):
     }
     with pytest.raises(CassetteMiss):
         replay.get("https://api.test/u", params={"page": "2"})
+
+
+def test_bodies_tell_posts_to_one_url_apart(tmp_path):
+    path = tmp_path / "tape.json"
+
+    class Echo:
+        def send(self, request, timeout):
+            return Response(200, {}, request.body)
+
+    recorder = Http(Cassette(path, "record", transport=Echo()))
+    for target in (b"first", b"second"):
+        recorder.post("https://api.test/rpc", content=target)
+    replay = Http(Cassette(path))
+    assert replay.post("https://api.test/rpc", content=b"second").body == b"second"
+    assert replay.post("https://api.test/rpc", content=b"first").body == b"first"

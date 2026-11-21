@@ -10,6 +10,7 @@
     assert result.complete and result.items[0]["id"] == "00u1"
 """
 
+import hashlib
 import io
 import json
 import os
@@ -128,8 +129,17 @@ class CassetteMiss(AssertionError):
     pass
 
 
+def _body_key(body: bytes | None) -> str | None:
+    return hashlib.sha256(body).hexdigest()[:16] if body else None
+
+
 class Cassette:
-    """Record or replay HTTP exchanges as JSON. Replay matches method and scrubbed URL, in order."""
+    """Record or replay HTTP exchanges as JSON.
+
+    Replay matches method, scrubbed URL, and (when the entry records one) a
+    hash of the request body, taking matches in recorded order. Hand-written
+    entries may omit `body_sha256` to match any body.
+    """
 
     def __init__(
         self,
@@ -146,19 +156,27 @@ class Cassette:
             for entry in json.loads(self.path.read_text())["interactions"]:
                 self._queues[(entry["method"], entry["url"])].append(entry)
 
+    def _take(self, key: tuple[str, str], body: bytes | None) -> dict[str, Any] | None:
+        queue = self._queues.get(key) or []
+        wanted = _body_key(body)
+        for index, entry in enumerate(queue):
+            if entry.get("body_sha256") in (None, wanted):
+                return queue.pop(index)
+        return None
+
     def send(self, request: Request, timeout: float) -> Response:
         key = (request.method, _scrub_url(request.url))
         if self.mode == "replay":
-            queue = self._queues.get(key)
-            if not queue:
+            entry = self._take(key, request.body)
+            if entry is None:
                 raise CassetteMiss(f"no recorded response for {key[0]} {key[1]}")
-            entry = queue.pop(0)
             return Response(entry["status"], entry["headers"], entry["body"].encode(), request.url)
         response = self._real.send(request, timeout)
         self._recorded.append(
             {
                 "method": key[0],
                 "url": key[1],
+                **({"body_sha256": _body_key(request.body)} if request.body else {}),
                 "status": response.status,
                 "headers": {k: v for k, v in response.headers.items() if k.lower() not in SCRUB_HEADERS},
                 "body": response.body.decode(errors="replace"),

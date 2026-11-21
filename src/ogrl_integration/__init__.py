@@ -1,6 +1,6 @@
 """Write OGRL integrations (RFC 0005). Standard library only, so packages ship no dependencies."""
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 from ogrl_integration.app import Context, Integration  # noqa: E402
 from ogrl_integration.errors import (  # noqa: E402
