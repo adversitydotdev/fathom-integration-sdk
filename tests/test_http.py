@@ -73,3 +73,27 @@ def test_paginate_link_header_and_cursor():
     )
     assert list(pages) == [1, 2]
     assert transport.sent[1].url == "https://api.test/y?limit=1&after=c2"
+
+
+def test_reset_headers_set_the_wait(monkeypatch):
+    monkeypatch.setattr("ogrl_integration.http.time.time", lambda: 1000.0)
+    waits: list[float] = []
+    okta = Script(Response(429, {"X-Rate-Limit-Reset": "1009"}, b""), ok([]))
+    Http(okta, sleep=waits.append).get("https://acme.okta.com/api/v1/users")
+    assert waits == [10]
+
+
+def test_github_primary_rate_limit_is_a_rate_limit_not_a_denial(monkeypatch):
+    monkeypatch.setattr("ogrl_integration.http.time.time", lambda: 1000.0)
+    limited = Response(403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1030"}, b"")
+    waits: list[float] = []
+    assert Http(Script(limited, ok({"x": 1})), sleep=waits.append).get("https://api.github.com/x").json() == {
+        "x": 1
+    }
+    assert waits == [31]
+    with pytest.raises(RateLimited) as caught:
+        Http(Script(*[limited] * 4), sleep=lambda _: None).get("https://api.github.com/x")
+    assert caught.value.retry_after == 31
+    denied = Response(403, {"x-ratelimit-remaining": "4999"}, b"")
+    with pytest.raises(PermissionDenied):
+        Http(Script(denied), sleep=lambda _: None).get("https://api.github.com/x")

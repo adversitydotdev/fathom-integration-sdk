@@ -90,14 +90,29 @@ class UrllibTransport:
             raise VendorError(f"{request.method} {request.url}: {exc}") from exc
 
 
-def _retry_after(response: Response) -> int | None:
+def _retry_after(response: Response, clock: Callable[[], float] = time.time) -> int | None:
+    """`Retry-After`, else the epoch-seconds reset Okta (`X-Rate-Limit-Reset`) and GitHub
+    (`X-RateLimit-Reset`) send instead."""
     value = response.header("retry-after")
-    if value is None:
+    if value is not None:
+        try:
+            return max(0, int(float(value)))
+        except ValueError:
+            return None
+    reset = response.header("x-rate-limit-reset") or response.header("x-ratelimit-reset")
+    if reset is None:
         return None
     try:
-        return max(0, int(float(value)))
+        return max(0, int(float(reset) - clock()) + 1)
     except ValueError:
         return None
+
+
+def _rate_limited(response: Response) -> bool:
+    """429, or GitHub's primary limit: 403 with no requests remaining."""
+    return response.status == 429 or (
+        response.status == 403 and response.header("x-ratelimit-remaining") == "0"
+    )
 
 
 class Http:
@@ -144,7 +159,8 @@ class Http:
         attempt = 0
         while True:
             response = self.transport.send(request, self.timeout)
-            if response.status not in RETRY_STATUSES or attempt >= self.retries:
+            retryable = response.status in RETRY_STATUSES or _rate_limited(response)
+            if not retryable or attempt >= self.retries:
                 break
             attempt += 1
             wait = _retry_after(response)
@@ -158,10 +174,10 @@ class Http:
         error: IntegrationError
         if response.status == 401:
             error = AuthFailed(where)
+        elif _rate_limited(response):
+            error = RateLimited(where, _retry_after(response))
         elif response.status == 403:
             error = PermissionDenied(where)
-        elif response.status == 429:
-            error = RateLimited(where, _retry_after(response))
         else:
             error = VendorError(where)
         error.status = response.status
