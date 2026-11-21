@@ -90,7 +90,7 @@ class UrllibTransport:
             raise VendorError(f"{request.method} {request.url}: {exc}") from exc
 
 
-def _retry_after(response: Response, clock: Callable[[], float] = time.time) -> int | None:
+def _retry_after(response: Response) -> int | None:
     """`Retry-After`, else the epoch-seconds reset Okta (`X-Rate-Limit-Reset`) and GitHub
     (`X-RateLimit-Reset`) send instead."""
     value = response.header("retry-after")
@@ -103,7 +103,7 @@ def _retry_after(response: Response, clock: Callable[[], float] = time.time) -> 
     if reset is None:
         return None
     try:
-        return max(0, int(float(reset) - clock()) + 1)
+        return max(0, int(float(reset) - time.time()) + 1)
     except ValueError:
         return None
 
