@@ -56,3 +56,9 @@ def test_conformance_from_a_relative_path(tmp_path, monkeypatch):
     cli.main(["new", str(tmp_path / "acme"), "--id", "dev.acme.directory", "--name", "Acme"])
     monkeypatch.chdir(tmp_path)
     assert all(f.ok for f in cli.conformance(__import__("pathlib").Path("acme")))
+
+
+def test_snapshot_files_may_be_documents_lists_or_json_lines():
+    assert cli._snapshot_items('{"source": "x", "items": [{"id": "1"}]}') == [{"id": "1"}]
+    assert cli._snapshot_items('[{"id": "1"}]') == [{"id": "1"}]
+    assert cli._snapshot_items('{"id": "1"}\n{"id": "2"}\n') == [{"id": "1"}, {"id": "2"}]

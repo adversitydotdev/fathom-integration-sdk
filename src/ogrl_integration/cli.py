@@ -75,6 +75,19 @@ def _pairs(values: list[str] | None) -> dict[str, str]:
     return out
 
 
+def _snapshot_items(text: str) -> list[dict[str, Any]]:
+    """A snapshot document (`{"items": [...]}`), or JSON Lines as `run collect --out` writes."""
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, dict) and isinstance(document.get("items"), list):
+        return document["items"]
+    if isinstance(document, list):
+        return document
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
 def _reference(text: str) -> tuple[str, int]:
     name, _, major = text.partition("@")
     if not NAME.match(name) or not major.isdigit():
@@ -120,13 +133,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             name, major = _reference(args.target or "")
             snapshots = {}
             for source, path in _pairs(args.snapshot).items():
-                text = Path(path).read_text()
-                items = (
-                    json.loads(text)["items"]
-                    if text.lstrip().startswith("{")
-                    else [json.loads(line) for line in text.splitlines() if line.strip()]
-                )
-                snapshots[source] = items
+                snapshots[source] = _snapshot_items(Path(path).read_text())
             print(json.dumps(harness.check(name, major, snapshots, _pairs(args.arg)), indent=2))
     except HarnessError as exc:
         print(f"{exc.kind}: {exc}", file=sys.stderr)
