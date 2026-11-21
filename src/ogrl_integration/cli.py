@@ -146,6 +146,7 @@ class Finding:
 
 def _process(root: Path, manifest: dict[str, Any], lines: list[dict[str, Any]], *, wait: float = 10):
     module, _, function = manifest["runtime"]["entrypoint"].partition(":")
+    root = root.resolve()  # the process runs from /, so a relative path would not resolve
     paths = [str(root), *map(str, sorted((root / "wheels").glob("*.whl")))]
     # The SDK this command runs from stands in for a packed wheel during development.
     paths.append(str(Path(ogrl_integration.__file__).resolve().parents[1]))

@@ -50,3 +50,9 @@ def test_pack_is_deterministic_and_carries_the_sdk(tmp_path):
         data = tar.extractfile(wheel).read()  # type: ignore[union-attr]
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         assert "ogrl_integration/app.py" in zf.namelist()
+
+
+def test_conformance_from_a_relative_path(tmp_path, monkeypatch):
+    cli.main(["new", str(tmp_path / "acme"), "--id", "dev.acme.directory", "--name", "Acme"])
+    monkeypatch.chdir(tmp_path)
+    assert all(f.ok for f in cli.conformance(__import__("pathlib").Path("acme")))
