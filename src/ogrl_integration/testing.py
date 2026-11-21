@@ -78,10 +78,12 @@ class Harness:
         version: int,
         config: Mapping[str, str],
         secrets: Mapping[str, str] | None = None,
+        query: Mapping[str, Any] | None = None,
     ) -> Collected:
-        result = self.call(
-            "collect", {"resource": resource, "version": version, "config": dict(config)}, secrets
-        )
+        params: dict[str, Any] = {"resource": resource, "version": version, "config": dict(config)}
+        if query is not None:
+            params["query"] = dict(query)
+        result = self.call("collect", params, secrets)
         items = self.streamed
         assert result["count"] == len(items), "count must equal the items streamed"
         return Collected(items, result["complete"], result.get("reason"), list(self.logs))

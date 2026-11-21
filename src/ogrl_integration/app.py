@@ -220,12 +220,32 @@ class Integration:
             raise TypeError("validate must return ctx.identity(...)")
         return identity.to_json()
 
+    def _openapi(self) -> Any:
+        if not hasattr(self, "_bundled"):
+            from ogrl_integration import openapi
+
+            self._bundled = openapi.load_bundled()
+        return self._bundled
+
     def _collect(self, channel: _Channel, params: dict[str, Any]) -> dict[str, Any]:
         key = (params.get("resource"), int(params.get("version") or 0))
-        fn = self.resources.get(key)  # type: ignore[arg-type]
-        if fn is None:
-            raise InvalidConfig(f"no resource {key[0]}@{key[1]}")
         ctx = self._context(channel, params, credentials=True)
+        if params.get("query") is not None:  # a query source (OGRL RFC 0006)
+            from ogrl_integration import openapi
+
+            bundled = self._openapi()
+            if bundled is None:
+                raise InvalidConfig("this integration does not support query sources")
+            settings, description = bundled
+            query = openapi.Query.from_json(params["query"])
+
+            def fn(ctx: Context) -> Iterable[Mapping[str, Any]]:
+                return openapi.execute(ctx, description, settings, query)
+
+        else:
+            fn = self.resources.get(key)  # type: ignore[arg-type,assignment]
+            if fn is None:
+                raise InvalidConfig(f"no resource {key[0]}@{key[1]}")
         count, complete, reason = 0, True, None
         batch: list[str] = []
         size = 0

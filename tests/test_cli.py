@@ -62,3 +62,28 @@ def test_snapshot_files_may_be_documents_lists_or_json_lines():
     assert cli._snapshot_items('{"source": "x", "items": [{"id": "1"}]}') == [{"id": "1"}]
     assert cli._snapshot_items('[{"id": "1"}]') == [{"id": "1"}]
     assert cli._snapshot_items('{"id": "1"}\n{"id": "2"}\n') == [{"id": "1"}, {"id": "2"}]
+
+
+def test_run_collect_with_a_query_finds_the_bundled_description(tmp_path, monkeypatch):
+    """Regression: the generated module was imported after the package left sys.path."""
+    import sys
+
+    root = tmp_path / "acme"
+    cli.main(["new", str(root), "--id", "dev.acme.directory", "--name", "Acme"])
+    (root / "api.json").write_text(
+        '{"openapi": "3.0.3", "info": {"title": "x", "version": "1"}, "paths": {"/items": {"get": {'
+        '"operationId": "listItems", "responses": {"200": {"content": {"application/json": {"schema": {'
+        '"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, '
+        '"label": {"type": "string"}}}}}}}}}}}}'
+    )
+    manifest = root / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text()
+        + 'openapi:\n  description: api.json\n  base_url: "https://{base_host}"\n  pagination: none\n'
+    )
+    sys.modules.pop("_ogrl_openapi", None)
+    app = cli.load_app(root, cli.load_manifest(root))
+    assert app._openapi() is not None
+    assert "_ogrl_openapi.py" in {p.name for p in cli._package_files(root)}
+    assert "api.json" in {p.name for p in cli._package_files(root)}
+    sys.modules.pop("_ogrl_openapi", None)

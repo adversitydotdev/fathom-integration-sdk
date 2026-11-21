@@ -48,13 +48,36 @@ def load_manifest(root: Path) -> dict[str, Any]:
     return yaml.safe_load((root / "manifest.yaml").read_text())
 
 
+def build_openapi(root: Path, manifest: dict[str, Any] | None = None) -> Path | None:
+    """Write the generated description module when the manifest declares `openapi`."""
+    from ogrl_integration import openapi
+
+    manifest = manifest or load_manifest(root)
+    block = manifest.get("openapi")
+    if not block:
+        return None
+    yaml = _need("yaml")
+    source = root / block["description"]
+    text = source.read_text()
+    document = json.loads(text) if source.suffix == ".json" else yaml.safe_load(text)
+    settings = openapi.Settings.from_json(block)
+    openapi.Description(document)  # fails early on a malformed description
+    target = root / f"{openapi.GENERATED_MODULE}.py"
+    target.write_text(openapi.encode(settings, document))
+    return target
+
+
 def load_app(root: Path, manifest: dict[str, Any]) -> Integration:
     """Import the package's `Integration` from its `module:attr.run` entrypoint."""
     module_name, _, attr = manifest["runtime"]["entrypoint"].partition(":")
+    build_openapi(root, manifest)
     sys.path.insert(0, str(root))
     try:
         sys.modules.pop(module_name, None)
+        sys.modules.pop("_ogrl_openapi", None)
         module = importlib.import_module(module_name)
+        if (root / "_ogrl_openapi.py").is_file():
+            importlib.import_module("_ogrl_openapi")  # while the package is on sys.path
     finally:
         sys.path.remove(str(root))
     target: Any = module
@@ -121,7 +144,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(json.dumps(harness.validate(config, _secrets(manifest)), indent=2))
         elif args.operation == "collect":
             name, major = _reference(args.target or "")
-            result = harness.collect(name, major, config, _secrets(manifest))
+            query = None
+            if args.query:
+                definition = _need("yaml").safe_load(Path(args.query).read_text())
+                keys = ("operation", "params", "items", "fields")
+                query = {k: definition[k] for k in keys if k in definition}
+            result = harness.collect(name, major, config, _secrets(manifest), query=query)
             lines = "".join(json.dumps(item) + "\n" for item in result.items)
             if args.out:
                 Path(args.out).write_text(lines)
@@ -335,11 +363,18 @@ def sdk_wheel() -> tuple[str, bytes]:
 
 
 def _package_files(root: Path) -> Iterator[Path]:
+    manifest = load_manifest(root)
+    # The host validates query sources against the raw description (it never imports package code).
+    description = (manifest.get("openapi") or {}).get("description")
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if not path.is_file() or EXCLUDED_DIRS.intersection(relative.parts[:-1]):
             continue
-        if relative.parts[0] == "manifest.yaml" or relative.parts[0] == "schemas" or path.suffix == ".py":
+        if (
+            relative.parts[0] in ("manifest.yaml", "schemas")
+            or path.suffix == ".py"
+            or relative.as_posix() == description
+        ):
             yield path
 
 
@@ -535,6 +570,37 @@ def test_check_names_disabled_items():
     return 0
 
 
+# --- openapi ---------------------------------------------------------------------------------
+
+
+def cmd_openapi_build(args: argparse.Namespace) -> int:
+    target = build_openapi(Path(args.package))
+    if target is None:
+        sys.exit("the manifest declares no openapi block")
+    print(f"{target} ({target.stat().st_size} bytes)")
+    return 0
+
+
+def cmd_openapi_search(args: argparse.Namespace) -> int:
+    from ogrl_integration import openapi
+
+    root = Path(args.package).resolve()
+    build_openapi(root)
+    sys.path.insert(0, str(root))
+    sys.modules.pop(openapi.GENERATED_MODULE, None)
+    bundled = openapi.load_bundled()
+    if bundled is None:
+        sys.exit("the manifest declares no openapi block")
+    settings, description = bundled
+    words = args.text.lower().split()
+    for op in description.operations.values():
+        if op.method != "GET" and op.id not in settings.read_operations:
+            continue
+        if all(w in f"{op.id} {op.path} {op.summary}".lower() for w in words):
+            print(f"{op.id:40} {op.method} {op.path}  {op.summary[:70]}")
+    return 0
+
+
 # --- entry -------------------------------------------------------------------------------------
 
 
@@ -556,10 +622,23 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--arg", action="append", metavar="KEY=VALUE", help="check arguments")
     run.add_argument("--snapshot", action="append", metavar="SOURCE=PATH", help="check input")
     run.add_argument("--out", help="write collected items as JSON Lines here")
+    run.add_argument(
+        "--query", metavar="FILE", help="collect a query source defined in a YAML file (RFC 0006)"
+    )
     tape = run.add_mutually_exclusive_group()
     tape.add_argument("--record", metavar="CASSETTE", help="record vendor HTTP, credentials scrubbed")
     tape.add_argument("--replay", metavar="CASSETTE")
     run.set_defaults(func=cmd_run)
+
+    api = sub.add_parser("openapi", help="query sources: build the bundled description, or search it")
+    api_sub = api.add_subparsers(dest="action", required=True)
+    api_build = api_sub.add_parser("build", help="write _ogrl_openapi.py from the manifest's openapi block")
+    api_build.add_argument("package")
+    api_build.set_defaults(func=cmd_openapi_build)
+    api_search = api_sub.add_parser("search", help="find read operations by id, path, or summary")
+    api_search.add_argument("package")
+    api_search.add_argument("text")
+    api_search.set_defaults(func=cmd_openapi_search)
 
     test = sub.add_parser("test", help="run the conformance suite")
     test.add_argument("package")
