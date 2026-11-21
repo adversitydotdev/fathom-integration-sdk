@@ -14,7 +14,6 @@ import hashlib
 import io
 import json
 import os
-import tempfile
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -51,6 +50,7 @@ class Harness:
     def __init__(self, app: Integration) -> None:
         self.app = app
         self.logs: list[str] = []
+        self.streamed: list[dict[str, Any]] = []
 
     def call(self, method: str, params: Mapping[str, Any], env: Mapping[str, str] | None = None) -> Any:
         requests = [
@@ -63,6 +63,7 @@ class Harness:
             self.app.run(stdin, stdout)
         messages = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.logs += [m["params"]["message"] for m in messages if m.get("method") == "log"]
+        self.streamed = [i for m in messages if m.get("method") == "items" for i in m["params"]["items"]]
         (answer,) = [m for m in messages if m.get("id") == 2]
         if "error" in answer:
             raise HarnessError(answer["error"])
@@ -78,15 +79,11 @@ class Harness:
         config: Mapping[str, str],
         secrets: Mapping[str, str] | None = None,
     ) -> Collected:
-        with tempfile.TemporaryDirectory() as scratch:
-            output = Path(scratch) / "items.jsonl"
-            result = self.call(
-                "collect",
-                {"resource": resource, "version": version, "config": dict(config), "output": str(output)},
-                secrets,
-            )
-            items = [json.loads(line) for line in output.read_text().splitlines() if line.strip()]
-        assert result["count"] == len(items), "count must equal the items written"
+        result = self.call(
+            "collect", {"resource": resource, "version": version, "config": dict(config)}, secrets
+        )
+        items = self.streamed
+        assert result["count"] == len(items), "count must equal the items streamed"
         return Collected(items, result["complete"], result.get("reason"), list(self.logs))
 
     def check(
@@ -98,22 +95,20 @@ class Harness:
         params: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """`snapshots` maps a source (`dev.example/users@1`) to its items."""
-        with tempfile.TemporaryDirectory() as scratch:
-            paths = {}
-            for index, (source, items) in enumerate(snapshots.items()):
-                path = Path(scratch) / f"snapshot-{index}.json"
-                path.write_text(json.dumps({"source": source, "complete": True, "items": items}))
-                paths[source] = str(path)
-            return self.call(
-                "check",
-                {
-                    "check": name,
-                    "version": version,
-                    "args": dict(args or {}),
-                    "params": dict(params or {}),
-                    "snapshots": paths,
-                },
-            )
+        documents = {
+            source: {"source": source, "complete": True, "items": list(items)}
+            for source, items in snapshots.items()
+        }
+        return self.call(
+            "check",
+            {
+                "check": name,
+                "version": version,
+                "args": dict(args or {}),
+                "params": dict(params or {}),
+                "snapshots": documents,
+            },
+        )
 
 
 # --- Cassettes ---------------------------------------------------------------------------------

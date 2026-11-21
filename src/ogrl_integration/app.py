@@ -15,6 +15,11 @@
         app.run()
 
 `id` and `version` must equal the manifest; `ogrl-integration test` checks.
+
+Nothing here touches the filesystem: collected items stream to the host as
+`items` notifications and snapshots arrive inside the `check` request, so a
+package runs on a read-only filesystem, even loaded from memory. Do not read
+files next to your module; put data in code.
 """
 
 import json
@@ -32,6 +37,10 @@ from ogrl_integration.outcomes import Identity, Outcome
 PROTOCOL = 1
 METHOD_NOT_FOUND = -32601
 SERVER_ERROR = -32000
+# Items stream back as `items` notifications, each line kept under the host's 1 MB limit.
+BATCH_BYTES = 512 * 1024
+BATCH_ITEMS = 500
+LINE_LIMIT = 1024 * 1024
 
 
 class _Channel:
@@ -46,6 +55,10 @@ class _Channel:
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self.send({"method": method, "params": params})
+
+    def raw(self, line: str) -> None:
+        self._out.write(line + "\n")
+        self._out.flush()
 
 
 @dataclass
@@ -214,17 +227,32 @@ class Integration:
             raise InvalidConfig(f"no resource {key[0]}@{key[1]}")
         ctx = self._context(channel, params, credentials=True)
         count, complete, reason = 0, True, None
-        with open(params["output"], "w") as out:
-            try:
-                for item in _items(fn(ctx)):
-                    out.write(json.dumps(item, separators=(",", ":"), default=str) + "\n")
-                    count += 1
-            except Incomplete as exc:
-                complete, reason = False, exc.reason
-            except RateLimited as exc:
-                if count == 0:
-                    raise  # nothing collected: let the host retry the whole operation
-                complete, reason = False, exc.message
+        batch: list[str] = []
+        size = 0
+
+        def flush() -> None:
+            nonlocal batch, size
+            if batch:
+                channel.raw('{"jsonrpc":"2.0","method":"items","params":{"items":[' + ",".join(batch) + "]}}")
+                batch, size = [], 0
+
+        try:
+            for item in _items(fn(ctx)):
+                encoded = json.dumps(item, separators=(",", ":"), default=str)
+                if len(encoded) > LINE_LIMIT - 1024:
+                    raise ValueError(f"item {count} is larger than 1 MB; split it or drop fields")
+                if size + len(encoded) > BATCH_BYTES or len(batch) >= BATCH_ITEMS:
+                    flush()
+                batch.append(encoded)
+                size += len(encoded) + 1
+                count += 1
+        except Incomplete as exc:
+            complete, reason = False, exc.reason
+        except RateLimited as exc:
+            if count == 0:
+                raise  # nothing collected: let the host retry the whole operation
+            complete, reason = False, exc.message
+        flush()
         return {"count": count, "complete": complete, **({"reason": reason} if reason else {})}
 
     def _check(self, channel: _Channel, params: dict[str, Any]) -> dict[str, Any]:
@@ -233,10 +261,9 @@ class Integration:
         if fn is None:
             raise InvalidConfig(f"no check {key[0]}@{key[1]}")
         snapshots: dict[str, list[Any]] = {}
-        for source, path in (params.get("snapshots") or {}).items():
+        for source, document in (params.get("snapshots") or {}).items():
             name = source.rsplit("/", 1)[-1].split("@", 1)[0]
-            with open(path) as handle:
-                snapshots[name.replace("-", "_")] = json.load(handle).get("items", [])
+            snapshots[name.replace("-", "_")] = (document or {}).get("items", [])
         outcome = fn(self._context(channel, params, credentials=False), **snapshots)
         if not isinstance(outcome, Outcome):
             raise TypeError("a check returns pass_(...), fail(...), or error(...)")

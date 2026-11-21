@@ -109,3 +109,37 @@ def test_checks_get_snapshots_and_nothing_else():
     with pytest.raises(HarnessError) as caught:
         harness.check("http", 1, {"dev.example.test/users@1": []})
     assert "checks evaluate snapshots" in caught.value.error["message"]
+
+
+big = Integration("dev.example.big", "1.0.0")
+
+
+@big.resource("rows", version=1)
+def rows(ctx):
+    for n in range(1200):
+        yield {"id": str(n), "name": "x" * 1000}
+
+
+@big.resource("huge", version=1)
+def huge(ctx):
+    yield {"id": "1", "name": "x" * (2 * 1024 * 1024)}
+
+
+def test_items_stream_in_batches_under_the_line_limit():
+    out = io.StringIO()
+    lines = [
+        {"jsonrpc": "2.0", "id": 1, "method": "collect", "params": {"resource": "rows", "version": 1}},
+    ]
+    big.run(io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), out)
+    messages = out.getvalue().splitlines()
+    batches = [json.loads(m) for m in messages if '"method":"items"' in m]
+    assert len(batches) >= 3
+    assert all(len(m) < 1024 * 1024 for m in messages)
+    assert sum(len(b["params"]["items"]) for b in batches) == 1200
+    assert json.loads(messages[-1])["result"] == {"count": 1200, "complete": True}
+
+
+def test_an_item_over_the_line_limit_is_an_error():
+    with pytest.raises(HarnessError) as caught:
+        Harness(big).collect("huge", 1, {})
+    assert "larger than 1 MB" in caught.value.error["message"]

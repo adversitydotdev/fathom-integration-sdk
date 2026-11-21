@@ -19,7 +19,6 @@ import re
 import subprocess
 import sys
 import tarfile
-import tempfile
 import time
 import zipfile
 from collections.abc import Iterator
@@ -150,13 +149,15 @@ def _process(root: Path, manifest: dict[str, Any], lines: list[dict[str, Any]], 
     paths = [str(root), *map(str, sorted((root / "wheels").glob("*.whl")))]
     # The SDK this command runs from stands in for a packed wheel during development.
     paths.append(str(Path(ogrl_integration.__file__).resolve().parents[1]))
-    env = {"PATH": "/usr/bin:/bin", "HOME": tempfile.gettempdir(), "PYTHONPATH": os.pathsep.join(paths)}
+    # As the OGRL host runs it: no writable working directory, no HOME, no bytecode writes.
+    env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": os.pathsep.join(paths)}
     process = subprocess.Popen(
         [sys.executable, "-c", f"import {module} as m; m.{function or 'main'}()"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
+        cwd="/",
         text=True,
     )
     started = time.monotonic()
