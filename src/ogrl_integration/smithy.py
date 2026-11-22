@@ -27,7 +27,14 @@ from urllib.parse import quote, urlencode, urlsplit
 from xml.etree import ElementTree
 
 from ogrl_integration import sigv4
-from ogrl_integration.errors import Incomplete, IntegrationError, InvalidConfig, RateLimited
+from ogrl_integration.errors import (
+    Incomplete,
+    IntegrationError,
+    InvalidConfig,
+    PermissionDenied,
+    RateLimited,
+    VendorError,
+)
 from ogrl_integration.openapi import FIELD_NAME, MAX_PARAM, QUERY_NAME, Problem
 from ogrl_integration.openapi import Query as _OpenApiQuery
 
@@ -1064,10 +1071,18 @@ def _send(ctx: Any, call: _Call, region: str, signing_name: str) -> Any:
         region=region,
         service=signing_name,
     )
-    return ctx.http.request(
-        call.method, call.url, headers=signed, content=call.body or None,
-        throttled=_throttled, error_detail=_error_detail,
-    )  # fmt: skip
+    try:
+        return ctx.http.request(
+            call.method, call.url, headers=signed, content=call.body or None,
+            throttled=_throttled, error_detail=_error_detail,
+        )  # fmt: skip
+    except VendorError as exc:
+        # AWS JSON services answer 400 AccessDeniedException where others answer 403.
+        if re.search(r": (AccessDenied|UnauthorizedOperation|UnrecognizedClient)", exc.message):
+            denied = PermissionDenied(exc.message)
+            denied.status = exc.status
+            raise denied from exc
+        raise
 
 
 def _pages(ctx: Any, api: Api, op: Operation, query: Query, region: str | None) -> Iterator[Any]:

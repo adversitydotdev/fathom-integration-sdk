@@ -708,3 +708,16 @@ def test_throttling_is_retried():
     http = Http(Throttled(), sleep=lambda s: None)
     http.request("POST", "https://iam.amazonaws.com/", throttled=smithy._throttled)
     assert Throttled.calls == 2
+
+
+def test_json_access_denied_is_a_permission_error(bundled):
+    class Denied(FakeAws):
+        def kms(self, payload):
+            body = {"__type": "AccessDeniedException", "message": "not authorized to perform: kms:ListKeys"}
+            return Response(400, {}, json.dumps(body).encode())
+
+    keys = smithy.Query("kms.ListKeys", fields={"id": "KeyId", "name": "KeyArn"}, regions="*")
+    with pytest.raises(HarnessError) as caught:
+        collect(keys, aws=Denied())
+    assert caught.value.kind == "permission_denied"
+    assert "AccessDeniedException: not authorized" in caught.value.error["message"]
