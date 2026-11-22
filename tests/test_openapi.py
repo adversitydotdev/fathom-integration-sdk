@@ -57,6 +57,21 @@ DOCUMENT = {
                 },
             },
         },
+        "/api/v1/groups": {
+            "get": {
+                "operationId": "listGroups",
+                "parameters": [{"name": "q", "in": "query", "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "array", "items": {"$ref": "#/components/schemas/Group"}}
+                            }
+                        }
+                    }
+                },
+            }
+        },
         "/api/v1/search": {
             "post": {
                 "operationId": "searchApps",
@@ -101,6 +116,14 @@ DOCUMENT = {
                         },
                     },
                 ]
+            },
+            "Group": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "profile": {"type": "object", "properties": {"name": {"type": "string"}}},
+                },
             },
             "Member": {
                 "oneOf": [
@@ -315,3 +338,92 @@ def test_max_items_stops_before_the_next_page(bundled):
     out = Harness(app).collect("apps", 1, {"domain": "acme.vendor.test"}, {"API_TOKEN": "t"}, query=query)
     assert [i["name"] for i in out.items] == ["Slack", "Jira"]
     assert len(vendor.requests) == 1  # page 2 was never fetched
+
+
+# --- for_each (RFC 0006 section 3) --------------------------------------------------------------
+
+MEMBERS = openapi.Query(
+    "listMembers",
+    items="data",
+    fields={"id": "id", "name": "login", "group": "$parent.profile.name"},
+    for_each=openapi.ForEach("listGroups", bind={"groupId": "id"}, params={"q": "Admin"}),
+)
+
+
+def test_for_each_validates_both_calls(description):
+    problems, schema = check(description, MEMBERS)
+    assert problems == {}
+    assert schema["required"] == ["error", "group", "id", "name"]
+    assert schema["properties"]["error"] == {"type": ["string", "null"]}
+    assert schema["properties"]["id"]["type"] == ["integer", "null"]
+    assert schema["properties"]["group"]["type"] == ["string", "null"]
+
+    def problems_with(**changes):
+        fe = {**MEMBERS.for_each.__dict__, **changes.pop("for_each", {})}
+        query = openapi.Query(**{**MEMBERS.__dict__, **changes, "for_each": openapi.ForEach(**fe)})
+        return check(description, query)[0]
+
+    assert problems_with(for_each={"bind": {"groupId": "idd"}}) == {
+        "/for_each/bind/groupId": "items have no 'idd'; did you mean 'id'?"
+    }
+    assert problems_with(for_each={"bind": {"group": "id"}}) == {
+        "/for_each/bind/group": "listMembers has no parameter 'group'",
+        "/params/groupId": "/api/v1/groups/{groupId}/members needs groupId",
+    }
+    assert problems_with(params={"groupId": "g1"}) == {
+        "/params/groupId": "for_each binds groupId; leave it out of params"
+    }
+    assert "only reads" in problems_with(for_each={"operation": "createApp"})["/for_each/operation"]
+    assert problems_with(for_each={"limit": 9000}) == {"/for_each/limit": "between 1 and 5000"}
+    plain = openapi.Query("listApps", fields={"id": "id", "name": "$parent.label"})
+    assert check(description, plain)[0] == {
+        "/fields/name": "$parent reads the listed item of a for_each query"
+    }
+
+
+class Groups:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+
+    def send(self, request: Request, timeout: float) -> Response:
+        self.requests.append(request.url)
+        path = request.url.split("vendor.test", 1)[1]
+        if path.startswith("/api/v1/groups?"):
+            body = [
+                {"id": "g1", "profile": {"name": "Admins"}},
+                {"id": "g2", "profile": {"name": "Gone"}},
+                {"id": "../apps", "profile": {"name": "Sneaky"}},
+            ]
+            return Response(200, {}, json.dumps(body).encode())
+        if path == "/api/v1/groups/g1/members":
+            return Response(200, {}, json.dumps({"data": [{"id": 7, "login": "ada@acme.test"}]}).encode())
+        error = {"errorCode": "E0000007", "errorSummary": "Not found: Resource not found: g2 (UserGroup)"}
+        return Response(404, {}, json.dumps(error).encode())
+
+
+def test_for_each_calls_once_per_listed_item(bundled):
+    app = Integration("dev.example.vendor", "1.0.0")
+    app.transport = vendor = Groups()
+    spec = {**query_json(MEMBERS), "for_each": MEMBERS.for_each.__dict__}
+    out = Harness(app).collect("members", 1, {"domain": "acme.vendor.test"}, {"API_TOKEN": "t"}, query=spec)
+    assert out.complete
+    assert out.items == [
+        {"id": "7", "name": "ada@acme.test", "group": "Admins", "error": None},
+        {"id": None, "name": None, "group": "Gone", "error": "E0000007"},
+        {"id": None, "name": None, "group": "Sneaky", "error": "InvalidParentValue"},
+    ]
+    assert vendor.requests == [
+        "https://acme.vendor.test/api/v1/groups?q=Admin",
+        "https://acme.vendor.test/api/v1/groups/g1/members",
+        "https://acme.vendor.test/api/v1/groups/g2/members",
+    ]  # the group id with a slash never reached a URL
+
+
+def test_for_each_limit_makes_the_collection_incomplete(bundled):
+    app = Integration("dev.example.vendor", "1.0.0")
+    app.transport = Groups()
+    limited = {**MEMBERS.for_each.__dict__, "limit": 1}
+    spec = {**query_json(MEMBERS), "for_each": limited}
+    out = Harness(app).collect("members", 1, {"domain": "acme.vendor.test"}, {"API_TOKEN": "t"}, query=spec)
+    assert [i["name"] for i in out.items] == ["ada@acme.test"]
+    assert (out.complete, out.reason) == (False, "listGroups listed more than 1 items")

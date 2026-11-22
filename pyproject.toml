@@ -1,6 +1,6 @@
 [project]
 name = "ogrl-integration"
-version = "0.1.0a11"
+version = "0.1.0a12"
 description = "Write OGRL integrations: the protocol, an HTTP client, a test kit, and packaging (RFC 0005)."
 license = "Apache-2.0"
 authors = [

@@ -36,7 +36,8 @@ from ogrl_integration.errors import (
     RateLimited,
     VendorError,
 )
-from ogrl_integration.openapi import FIELD_NAME, MAX_PARAM, QUERY_NAME, Problem
+from ogrl_integration.openapi import FIELD_NAME, MAX_LIMIT, MAX_PARAM, QUERY_NAME, Problem
+from ogrl_integration.openapi import ForEach as ForEach  # shared with OpenAPI query sources
 from ogrl_integration.openapi import Query as _OpenApiQuery
 
 GENERATED_MODULE = "_ogrl_smithy"
@@ -47,7 +48,6 @@ READ_PREFIX = re.compile(r"^(List|Describe|Get)[A-Z]")
 REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d{1,2}$")
 MEMBER_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 SELF, REGION_PATH, PARENT_PREFIX = ".", "$region", "$parent."
-DEFAULT_LIMIT, MAX_LIMIT = 1000, 5000
 MAX_DEPTH = 6
 MAX_PAGES = 10_000
 THROTTLE_CODES = frozenset(
@@ -179,40 +179,25 @@ class Settings:
 
 
 @dataclass
-class ForEach:
-    """Call `operation` once per item a list operation returns (RFC 0007 section 4)."""
-
-    operation: str
-    bind: dict[str, str]  # operation parameter -> path in each listed item
-    params: dict[str, str] = field(default_factory=dict)
-    items: str = ""
-    limit: int = DEFAULT_LIMIT
-
-    @classmethod
-    def from_json(cls, data: Mapping[str, Any]) -> "ForEach":
-        return cls(
-            operation=str(data.get("operation") or ""),
-            bind={str(k): str(v) for k, v in (data.get("bind") or {}).items()},
-            params={str(k): str(v) for k, v in (data.get("params") or {}).items()},
-            items=str(data.get("items") or ""),
-            limit=int(data.get("limit") or DEFAULT_LIMIT),
-        )
-
-
-@dataclass
 class Query(_OpenApiQuery):
     """RFC 0006's definition plus `regions` (codes, or "*" for the connection's) and `for_each`."""
 
     regions: list[str] | str = field(default_factory=list)
-    for_each: ForEach | None = None
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "Query":
         base = _OpenApiQuery.from_json(data)
         raw = data.get("regions") or []
         regions: list[str] | str = raw if isinstance(raw, str) else [str(r) for r in raw]
-        for_each = ForEach.from_json(data["for_each"]) if data.get("for_each") else None
-        return cls(base.operation, base.params, base.items, base.fields, base.max_items, regions, for_each)
+        return cls(
+            operation=base.operation,
+            params=base.params,
+            items=base.items,
+            fields=base.fields,
+            max_items=base.max_items,
+            for_each=base.for_each,
+            regions=regions,
+        )
 
 
 # --- models -----------------------------------------------------------------------------------

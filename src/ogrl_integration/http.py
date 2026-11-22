@@ -216,6 +216,7 @@ class Http:
         cursor: Callable[[Response], str | None] | None = None,
         cursor_param: str = "cursor",
         max_pages: int = 10_000,
+        error_detail: Callable[[Response], str | None] | None = None,
     ) -> Iterator[Any]:
         """Yield every item across pages.
 
@@ -225,7 +226,7 @@ class Http:
         """
         current_params = dict(params or {})
         for _ in range(max_pages):
-            response = self.get(url, params=current_params, headers=headers)
+            response = self.get(url, params=current_params, headers=headers, error_detail=error_detail)
             yield from items(response)
             if cursor is not None:
                 token = cursor(response)

@@ -23,7 +23,14 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from ogrl_integration.errors import InvalidConfig
+from ogrl_integration.errors import (
+    AuthFailed,
+    Incomplete,
+    IntegrationError,
+    InvalidConfig,
+    PermissionDenied,
+    RateLimited,
+)
 
 METHODS = ("get", "put", "post", "delete", "patch", "head", "options", "trace")
 FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -33,6 +40,8 @@ MAX_PARAM = 2048
 HOST_VALUE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")  # no /, ?, #, @, or :
 MAX_DEPTH = 6
 GENERATED_MODULE = "_ogrl_openapi"
+SELF, PARENT_PREFIX = ".", "$parent."
+DEFAULT_LIMIT, MAX_LIMIT = 1000, 5000
 
 
 @dataclass(frozen=True)
@@ -83,12 +92,34 @@ class Operation:
 
 
 @dataclass
+class ForEach:
+    """Per-item calls (RFC 0006 section 3): `operation` once per item a list operation returns."""
+
+    operation: str
+    bind: dict[str, str]  # operation parameter -> path in each listed item
+    params: dict[str, str] = field(default_factory=dict)
+    items: str = ""
+    limit: int = DEFAULT_LIMIT
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "ForEach":
+        return cls(
+            operation=str(data.get("operation") or ""),
+            bind={str(k): str(v) for k, v in (data.get("bind") or {}).items()},
+            params={str(k): str(v) for k, v in (data.get("params") or {}).items()},
+            items=str(data.get("items") or ""),
+            limit=int(data.get("limit") or DEFAULT_LIMIT),
+        )
+
+
+@dataclass
 class Query:
     operation: str
     params: dict[str, str] = field(default_factory=dict)
     items: str = ""
     fields: dict[str, str] = field(default_factory=dict)
     max_items: int | None = None  # a dry run stops early; pages are fetched lazily
+    for_each: ForEach | None = None
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "Query":
@@ -98,6 +129,7 @@ class Query:
             items=str(data.get("items") or ""),
             fields={str(k): str(v) for k, v in (data.get("fields") or {}).items()},
             max_items=int(data["max_items"]) if data.get("max_items") else None,
+            for_each=ForEach.from_json(data["for_each"]) if data.get("for_each") else None,
         )
 
 
@@ -232,6 +264,111 @@ def _json_type(schema: Mapping[str, Any]) -> list[str]:
     return [base, "null"] if base in ("string", "integer", "number", "boolean", "object", "array") else []
 
 
+def _find(
+    description: Description, settings: Settings, name: str, pointer: str, problems: list[Problem]
+) -> Operation | None:
+    operation = description.operations.get(name)
+    if operation is None:
+        close = difflib.get_close_matches(name, list(description.operations), n=3, cutoff=0.6)
+        hint = f"; did you mean {' or '.join(repr(c) for c in close)}?" if close else ""
+        problems.append(Problem(pointer, f"no operation {name!r} in the description{hint}"))
+        return None
+    if operation.method != "GET" and operation.id not in settings.read_operations:
+        problems.append(
+            Problem(
+                pointer,
+                f"{operation.id} is {operation.method} {operation.path}: only reads can be queried",
+            )
+        )
+        return None
+    return operation
+
+
+def _check_params(
+    operation: Operation, params: Mapping[str, str], prefix: str, bound: set[str]
+) -> list[Problem]:
+    """Section 5 parameter rules; `bound` parameters are filled per item by for_each."""
+    problems: list[Problem] = []
+    for key, value in params.items():
+        pointer = f"{prefix}/{key}"
+        declared = operation.parameters.get(key)
+        if declared is None:
+            problems.append(Problem(pointer, f"{operation.id} has no parameter {key!r}"))
+            continue
+        if key in bound:
+            problems.append(Problem(pointer, f"for_each binds {key}; leave it out of params"))
+            continue
+        if len(value) > MAX_PARAM:
+            problems.append(Problem(pointer, f"longer than {MAX_PARAM} characters"))
+        if declared["in"] == "path" and ("/" in value or value in ("", ".", "..")):
+            problems.append(Problem(pointer, "a path parameter cannot contain / or be empty"))
+        kind = _type(declared["schema"])
+        if kind == "integer" and not re.fullmatch(r"-?\d+", value):
+            problems.append(Problem(pointer, f"{key} is an integer"))
+        if kind == "boolean" and value not in ("true", "false"):
+            problems.append(Problem(pointer, f"{key} is true or false"))
+        enum = declared["schema"].get("enum")
+        if enum and value not in [str(e) for e in enum]:
+            problems.append(Problem(pointer, f"{key} is one of {', '.join(map(str, enum))}"))
+    for key, declared in operation.parameters.items():
+        if declared["in"] == "path" and key not in params and key not in bound:
+            problems.append(Problem(f"{prefix}/{key}", f"{operation.path} needs {key}"))
+    return problems
+
+
+def _list_item(
+    description: Description, operation: Operation, items: str, pointer: str, problems: list[Problem]
+) -> dict[str, Any] | None:
+    """The schema of one item of the operation's list, or None after recording why."""
+    if operation.response is None:
+        problems.append(
+            Problem(pointer.replace("/items", "/operation"), f"{operation.id} documents no JSON response")
+        )
+        return None
+    if items and not all(PATH_SEGMENT.match(p) for p in items.split(".")):
+        problems.append(Problem(pointer, "a dotted path of property names, or empty"))
+        return None
+    container, _ = description.at(operation.response, items)
+    if container is None:
+        problems.append(Problem(pointer, f"the response has no {items!r}"))
+        return None
+    if _type(container).split(" ")[0] != "array":
+        where = f"{items!r}" if items else "the response body"
+        problems.append(Problem(pointer, f"{where} is not a list; set items to the path of the list"))
+        return None
+    return container.get("items") or {}
+
+
+def _field(
+    description: Description, item: Any, path: str, pointer: str, problems: list[Problem]
+) -> tuple[dict[str, Any], bool] | None:
+    """The projected schema of a dotted path in an item, and whether it is required."""
+    if path == SELF:
+        return {"type": _json_type(description.schema(item))}, True
+    if not path or not all(PATH_SEGMENT.match(p) for p in path.split(".")):
+        problems.append(Problem(pointer, "a dotted path of property names, such as profile.login"))
+        return None
+    node, required = description.at(item, path)
+    if node is None:
+        known = [f["path"] for f in description.fields_of(item) if not f["path"].startswith("_")]
+        close = difflib.get_close_matches(path, known, n=3, cutoff=0.6)
+        hint = (
+            f"did you mean {' or '.join(repr(c) for c in close)}?"
+            if close
+            else f"top-level fields: {', '.join(p for p in known if '.' not in p)[:300]}"
+        )
+        free_form = bool(description.schema(item).get("additionalProperties"))
+        problems.append(Problem(pointer, f"items have no {path!r}; {hint}", warning=free_form))
+        return {}, False
+    types = _json_type(node)
+    schema: dict[str, Any] = (
+        {"type": types if not required else [t for t in types if t != "null"]} if types else {}
+    )
+    if node.get("description"):
+        schema["description"] = node["description"][:200]
+    return schema, required
+
+
 def validate(
     description: Description, settings: Settings, query: Query, *, name: str | None = None
 ) -> tuple[list[Problem], dict[str, Any] | None]:
@@ -239,55 +376,33 @@ def validate(
     problems: list[Problem] = []
     if name is not None and not QUERY_NAME.match(name):
         problems.append(Problem("/name", "a name matches [a-z0-9-]+"))
-    operation = description.operations.get(query.operation)
+    operation = _find(description, settings, query.operation, "/operation", problems)
     if operation is None:
-        problems.append(Problem("/operation", f"no operation {query.operation!r} in the description"))
-        return problems, None
-    if operation.method != "GET" and operation.id not in settings.read_operations:
-        problems.append(
-            Problem(
-                "/operation",
-                f"{operation.id} is {operation.method} {operation.path}: only reads can be queried",
-            )
-        )
         return problems, None
 
-    for key, value in query.params.items():
-        declared = operation.parameters.get(key)
-        if declared is None:
-            problems.append(Problem(f"/params/{key}", f"{operation.id} has no parameter {key!r}"))
-            continue
-        if len(value) > MAX_PARAM:
-            problems.append(Problem(f"/params/{key}", f"longer than {MAX_PARAM} characters"))
-        if declared["in"] == "path" and ("/" in value or value in ("", ".", "..")):
-            problems.append(Problem(f"/params/{key}", "a path parameter cannot contain / or be empty"))
-        kind = _type(declared["schema"])
-        if kind == "integer" and not re.fullmatch(r"-?\d+", value):
-            problems.append(Problem(f"/params/{key}", f"{key} is an integer"))
-        if kind == "boolean" and value not in ("true", "false"):
-            problems.append(Problem(f"/params/{key}", f"{key} is true or false"))
-        enum = declared["schema"].get("enum")
-        if enum and value not in [str(e) for e in enum]:
-            problems.append(Problem(f"/params/{key}", f"{key} is one of {', '.join(map(str, enum))}"))
-    for key, declared in operation.parameters.items():
-        if declared["in"] == "path" and key not in query.params:
-            problems.append(Problem(f"/params/{key}", f"{operation.path} needs {key}"))
+    # Per-item calls, then parameters.
+    fe = query.for_each
+    parent_item: Any = None
+    if fe is not None:
+        parent = _find(description, settings, fe.operation, "/for_each/operation", problems)
+        if parent is not None:
+            if not (1 <= fe.limit <= MAX_LIMIT):
+                problems.append(Problem("/for_each/limit", f"between 1 and {MAX_LIMIT}"))
+            problems += _check_params(parent, fe.params, "/for_each/params", set())
+            parent_item = _list_item(description, parent, fe.items, "/for_each/items", problems)
+            if not fe.bind:
+                problems.append(Problem("/for_each/bind", f"bind at least one parameter of {operation.id}"))
+            for key, path in fe.bind.items():
+                pointer = f"/for_each/bind/{key}"
+                if key not in operation.parameters:
+                    problems.append(Problem(pointer, f"{operation.id} has no parameter {key!r}"))
+                elif parent_item is not None:
+                    _field(description, parent_item, path, pointer, problems)
+    problems += _check_params(operation, query.params, "/params", set(fe.bind) if fe else set())
 
-    if operation.response is None:
-        problems.append(Problem("/operation", f"{operation.id} documents no JSON response"))
+    item = _list_item(description, operation, query.items, "/items", problems)
+    if item is None:
         return problems, None
-    if query.items and not all(PATH_SEGMENT.match(p) for p in query.items.split(".")):
-        problems.append(Problem("/items", "a dotted path of property names, or empty"))
-        return problems, None
-    container, _ = description.at(operation.response, query.items)
-    if container is None:
-        problems.append(Problem("/items", f"the response has no {query.items!r}"))
-        return problems, None
-    if _type(container).split(" ")[0] != "array":
-        where = f"{query.items!r}" if query.items else "the response body"
-        problems.append(Problem("/items", f"{where} is not a list; set items to the path of the list"))
-        return problems, None
-    item = container.get("items") or {}
 
     if not query.fields:
         problems.append(Problem("/fields", "project at least id and name"))
@@ -295,38 +410,36 @@ def validate(
         if query.fields and required not in query.fields:
             problems.append(Problem(f"/fields/{required}", f"{required} is required: it names failing items"))
     properties: dict[str, Any] = {}
-    required_fields: list[str] = []
-    free_form = bool(description.schema(item).get("additionalProperties"))
     for key, path in query.fields.items():
+        pointer = f"/fields/{key}"
         if not FIELD_NAME.match(key):
-            problems.append(Problem(f"/fields/{key}", "output field names match [a-z][a-z0-9_]*"))
+            problems.append(Problem(pointer, "output field names match [a-z][a-z0-9_]*"))
             continue
-        if not path or not all(PATH_SEGMENT.match(p) for p in path.split(".")):
-            problems.append(
-                Problem(f"/fields/{key}", "a dotted path of property names, such as profile.login")
-            )
+        if fe is not None and key == "error":
+            problems.append(Problem(pointer, "error is added to every item of this query"))
             continue
-        node, required = description.at(item, path)
-        if node is None:
-            known = [f["path"] for f in description.fields_of(item) if not f["path"].startswith("_")]
-            close = difflib.get_close_matches(path, known, n=3, cutoff=0.6)
-            hint = (
-                f"did you mean {' or '.join(repr(c) for c in close)}?"
-                if close
-                else f"top-level fields: {', '.join(p for p in known if '.' not in p)[:300]}"
-            )
-            problems.append(Problem(f"/fields/{key}", f"items have no {path!r}; {hint}", warning=free_form))
-            properties[key] = {}
+        if path.startswith(PARENT_PREFIX):
+            if fe is None:
+                problems.append(Problem(pointer, "$parent reads the listed item of a for_each query"))
+            elif parent_item is not None:
+                found = _field(description, parent_item, path[len(PARENT_PREFIX) :], pointer, problems)
+                if found is not None:
+                    properties[key] = found[0]
             continue
-        types = _json_type(node)
-        properties[key] = (
-            {"type": types if not required else [t for t in types if t != "null"]} if types else {}
-        )
-        if node.get("description"):
-            properties[key]["description"] = node["description"][:200]
-        if required:
-            required_fields.append(key)
-    schema = {"type": "object", "required": sorted(query.fields), "properties": properties}
+        found = _field(description, item, path, pointer, problems)
+        if found is None:
+            continue
+        schema, _ = found
+        if fe is not None and "type" in schema and "null" not in schema["type"]:
+            schema = {**schema, "type": [*schema["type"], "null"]}  # empty when the call failed
+        properties[key] = schema
+    if fe is not None:
+        properties["error"] = {"type": ["string", "null"]}
+    schema = {
+        "type": "object",
+        "required": sorted({*query.fields, *(["error"] if fe else [])}),
+        "properties": properties,
+    }
     return problems, schema
 
 
@@ -357,13 +470,143 @@ def authorization(settings: Settings, env: Mapping[str, str]) -> str | None:
     return None
 
 
+def _vendor_detail(response: Any) -> str | None:
+    """The vendor's error code and message, from common JSON error shapes (Okta, GitHub)."""
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(body, Mapping):
+        return None
+    code = body.get("errorCode") or body.get("code") or body.get("error")
+    message = body.get("errorSummary") or body.get("message") or body.get("error_description")
+    if isinstance(code, str) and code:
+        return f"{code}: {message}" if isinstance(message, str) and message else code
+    return message if isinstance(message, str) and message else None
+
+
+def _vendor_code(exc: IntegrationError) -> str:
+    found = re.search(r"answered \d+: ([A-Za-z0-9_.-]+)", exc.message)
+    return found.group(1) if found else f"HTTP {exc.status or 'error'}"
+
+
+def _pages(
+    ctx: Any,
+    settings: Settings,
+    operation: Operation,
+    params: Mapping[str, str],
+    items: str,
+    base: str,
+    headers: Mapping[str, str],
+) -> Iterator[Any]:
+    """Every raw item of one operation, following the declared pagination."""
+    path = operation.path
+    query_params: dict[str, str] = {}
+    for key, value in params.items():
+        if operation.parameters[key]["in"] == "path":
+            path = path.replace("{" + key + "}", quote(value, safe=""))
+        else:
+            query_params[key] = value
+    url = base.rstrip("/") + path
+
+    def items_of(response: Any) -> list[Any]:
+        body = response.json()
+        found = _get(body, items) if items else body
+        if not isinstance(found, list):
+            raise InvalidConfig(f"the response's {items or 'body'} is not a list")
+        return found
+
+    common = {"params": query_params, "headers": headers, "items": items_of, "error_detail": _vendor_detail}
+    kind, _, rest = settings.pagination.partition(":")
+    if kind == "link":
+        return ctx.http.paginate(url, **common)
+    if kind == "next-url":
+        return ctx.http.paginate(url, **common, next_url=lambda r: _get(r.json(), rest))
+    if kind == "cursor":
+        source, _, param = rest.partition(":")
+        return ctx.http.paginate(url, **common, cursor=lambda r: _get(r.json(), source), cursor_param=param)
+    return iter(
+        items_of(ctx.http.get(url, params=query_params, headers=headers, error_detail=_vendor_detail))
+    )
+
+
+def _project(
+    raw: Any,
+    fields: Mapping[str, str],
+    parent: Any = None,
+    error: str | None = None,
+    per_item: bool = False,
+) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for key, path in fields.items():
+        if path.startswith(PARENT_PREFIX):
+            rest = path[len(PARENT_PREFIX) :]
+            projected[key] = parent if rest == SELF else _get(parent, rest)
+        elif raw is None:
+            projected[key] = None
+        else:
+            projected[key] = raw if path == SELF else _get(raw, path)
+    for key in ("id", "name"):
+        if projected.get(key) is not None and not isinstance(projected[key], str):
+            projected[key] = str(projected[key])
+    if per_item:
+        projected["error"] = error
+    return projected
+
+
+def _per_item(
+    ctx: Any,
+    description: Description,
+    settings: Settings,
+    query: Query,
+    base: str,
+    headers: Mapping[str, str],
+) -> Iterator[dict[str, Any]]:
+    """for_each (RFC 0006 section 3): one call of the operation per listed item."""
+    fe = query.for_each
+    assert fe is not None
+    operation = description.operations[query.operation]
+    parent_op = description.operations[fe.operation]
+    listed = _pages(ctx, settings, parent_op, fe.params, fe.items, base, headers)
+    for count, parent in enumerate(listed, 1):
+        if count > fe.limit:
+            raise Incomplete(f"{fe.operation} listed more than {fe.limit} items")
+        bound: dict[str, str] = {}
+        for key, path in fe.bind.items():
+            value = parent if path == SELF else _get(parent, path)
+            if value is not None:
+                bound[key] = value if isinstance(value, str) else json.dumps(value)
+        if len(bound) < len(fe.bind):
+            yield _project(None, query.fields, parent, "MissingParentValue", True)
+            continue
+        unsafe = [
+            key
+            for key, value in bound.items()
+            if operation.parameters[key]["in"] == "path"
+            and ("/" in value or value in ("", ".", "..") or len(value) > MAX_PARAM)
+        ]
+        if unsafe:
+            yield _project(None, query.fields, parent, "InvalidParentValue", True)
+            continue
+        try:
+            for raw in _pages(
+                ctx, settings, operation, {**query.params, **bound}, query.items, base, headers
+            ):
+                yield _project(raw, query.fields, parent, None, True)
+        except (AuthFailed, PermissionDenied, RateLimited):
+            raise
+        except IntegrationError as exc:
+            if exc.status is None or not 400 <= exc.status < 500:
+                raise
+            yield _project(None, query.fields, parent, _vendor_code(exc), True)
+
+
 def execute(ctx: Any, description: Description, settings: Settings, query: Query) -> Iterator[dict[str, Any]]:
     """Run a validated query and yield projected items. Re-checks the read-only rules."""
     problems, _ = validate(description, settings, query)
     errors = [p for p in problems if not p.warning]
     if errors:
         raise InvalidConfig("; ".join(f"{p.pointer}: {p.detail}" for p in errors))
-    operation = description.operations[query.operation]
     unsafe = [
         name
         for name in re.findall(r"\{(\w+)\}", settings.base_url)
@@ -377,14 +620,6 @@ def execute(ctx: Any, description: Description, settings: Settings, query: Query
     base_parts = urlsplit(base)
     if base_parts.scheme != "https" and base_parts.hostname not in ("localhost", "127.0.0.1"):
         raise InvalidConfig(f"{base} is not an https URL")
-    path = operation.path
-    query_params: dict[str, str] = {}
-    for key, value in query.params.items():
-        if operation.parameters[key]["in"] == "path":
-            path = path.replace("{" + key + "}", quote(value, safe=""))
-        else:
-            query_params[key] = value
-    url = base.rstrip("/") + path
     headers = {}
     auth = authorization(settings, ctx.env)
     if settings.authorization and auth is None:
@@ -392,41 +627,18 @@ def execute(ctx: Any, description: Description, settings: Settings, query: Query
     if auth:
         headers["Authorization"] = auth
 
-    def items_of(response: Any) -> list[Any]:
-        body = response.json()
-        found = _get(body, query.items) if query.items else body
-        if not isinstance(found, list):
-            raise InvalidConfig(f"the response's {query.items or 'body'} is not a list")
-        return found
-
-    kind, _, rest = settings.pagination.partition(":")
-    pages: Iterator[Any]
-    if kind == "link":
-        pages = ctx.http.paginate(url, params=query_params, headers=headers, items=items_of)
-    elif kind == "next-url":
-        pages = ctx.http.paginate(
-            url, params=query_params, headers=headers, items=items_of, next_url=lambda r: _get(r.json(), rest)
-        )
-    elif kind == "cursor":
-        source, _, param = rest.partition(":")
-        pages = ctx.http.paginate(
-            url,
-            params=query_params,
-            headers=headers,
-            items=items_of,
-            cursor=lambda r: _get(r.json(), source),
-            cursor_param=param,
+    produced: Iterator[dict[str, Any]]
+    if query.for_each is None:
+        operation = description.operations[query.operation]
+        produced = (
+            _project(raw, query.fields)
+            for raw in _pages(ctx, settings, operation, query.params, query.items, base, headers)
         )
     else:
-        pages = iter(items_of(ctx.http.get(url, params=query_params, headers=headers)))
+        produced = _per_item(ctx, description, settings, query, base, headers)
     if query.max_items is not None:
-        pages = itertools.islice(pages, query.max_items)
-    for raw in pages:
-        projected = {key: _get(raw, path) for key, path in query.fields.items()}
-        for key in ("id", "name"):
-            if projected.get(key) is not None and not isinstance(projected[key], str):
-                projected[key] = str(projected[key])
-        yield projected
+        produced = itertools.islice(produced, query.max_items)
+    yield from produced
 
 
 # --- bundling ---------------------------------------------------------------------------------
