@@ -67,17 +67,52 @@ def build_openapi(root: Path, manifest: dict[str, Any] | None = None) -> Path | 
     return target
 
 
+def smithy_api(root: Path, manifest: dict[str, Any] | None = None) -> Any:
+    """The manifest's `smithy` block with its models, untrimmed; None without one."""
+    from ogrl_integration import smithy
+
+    block = (manifest or load_manifest(root)).get("smithy")
+    if not block:
+        return None
+    settings = smithy.Settings.from_json(block)
+    return smithy.load(settings, lambda path: (root / path).read_bytes())
+
+
+def trimmed_models(api: Any) -> dict[str, dict[str, Any]]:
+    from ogrl_integration import smithy
+
+    return {name: smithy.trim(api, name) for name in api.models}
+
+
+def build_smithy(root: Path, manifest: dict[str, Any] | None = None) -> Path | None:
+    """Write the generated module of trimmed models when the manifest declares `smithy`."""
+    from ogrl_integration import smithy
+
+    api = smithy_api(root, manifest)
+    if api is None:
+        return None
+    target = root / f"{smithy.GENERATED_MODULE}.py"
+    target.write_text(smithy.encode(api.settings, trimmed_models(api)))
+    return target
+
+
+GENERATED = ("_ogrl_openapi", "_ogrl_smithy")
+
+
 def load_app(root: Path, manifest: dict[str, Any]) -> Integration:
     """Import the package's `Integration` from its `module:attr.run` entrypoint."""
     module_name, _, attr = manifest["runtime"]["entrypoint"].partition(":")
     build_openapi(root, manifest)
+    build_smithy(root, manifest)
     sys.path.insert(0, str(root))
     try:
         sys.modules.pop(module_name, None)
-        sys.modules.pop("_ogrl_openapi", None)
+        for generated in GENERATED:
+            sys.modules.pop(generated, None)
         module = importlib.import_module(module_name)
-        if (root / "_ogrl_openapi.py").is_file():
-            importlib.import_module("_ogrl_openapi")  # while the package is on sys.path
+        for generated in GENERATED:
+            if (root / f"{generated}.py").is_file():
+                importlib.import_module(generated)  # while the package is on sys.path
     finally:
         sys.path.remove(str(root))
     target: Any = module
@@ -147,7 +182,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             query = None
             if args.query:
                 definition = _need("yaml").safe_load(Path(args.query).read_text())
-                keys = ("operation", "params", "items", "fields")
+                keys = ("operation", "params", "items", "fields", "regions")
                 query = {k: definition[k] for k in keys if k in definition}
             result = harness.collect(name, major, config, _secrets(manifest), query=query)
             lines = "".join(json.dumps(item) + "\n" for item in result.items)
@@ -366,6 +401,7 @@ def _package_files(root: Path) -> Iterator[Path]:
     manifest = load_manifest(root)
     # The host validates query sources against the raw description (it never imports package code).
     description = (manifest.get("openapi") or {}).get("description")
+    models = {s["model"] for s in ((manifest.get("smithy") or {}).get("services") or {}).values()}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if not path.is_file() or EXCLUDED_DIRS.intersection(relative.parts[:-1]):
@@ -374,6 +410,7 @@ def _package_files(root: Path) -> Iterator[Path]:
             relative.parts[0] in ("manifest.yaml", "schemas")
             or path.suffix == ".py"
             or relative.as_posix() == description
+            or relative.as_posix() in models
         ):
             yield path
 
@@ -390,10 +427,20 @@ def pack(root: Path, out_dir: Path) -> tuple[Path, str]:
         info.uname = info.gname = ""
         tar.addfile(info, io.BytesIO(data))
 
+    # Smithy models ship trimmed to their queryable operations (RFC 0007 section 2).
+    api = smithy_api(root, manifest)
+    trimmed: dict[str, bytes] = {}
+    if api is not None:
+        build_smithy(root, manifest)
+        for name, document in trimmed_models(api).items():
+            trimmed[api.settings.services[name].model] = json.dumps(
+                document, separators=(",", ":"), sort_keys=True
+            ).encode()
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
         for path in _package_files(root):
-            entry(tar, path.relative_to(root).as_posix(), path.read_bytes())
+            relative = path.relative_to(root).as_posix()
+            entry(tar, relative, trimmed.get(relative) or path.read_bytes())
         for wheel in sorted((root / "wheels").glob("*.whl")):
             entry(tar, f"wheels/{wheel.name}", wheel.read_bytes())
         name, data = sdk_wheel()
@@ -601,6 +648,52 @@ def cmd_openapi_search(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- smithy ------------------------------------------------------------------------------------
+
+
+def _smithy_or_exit(root: Path) -> Any:
+    api = smithy_api(root)
+    if api is None:
+        sys.exit("the manifest declares no smithy block")
+    return api
+
+
+def cmd_smithy_build(args: argparse.Namespace) -> int:
+    target = build_smithy(Path(args.package))
+    if target is None:
+        sys.exit("the manifest declares no smithy block")
+    print(f"{target} ({target.stat().st_size} bytes)")
+    return 0
+
+
+def cmd_smithy_search(args: argparse.Namespace) -> int:
+    api = _smithy_or_exit(Path(args.package))
+    for op in api.search(args.text, limit=args.limit):
+        print(f"{op.name:55} {op.protocol:11} {op.summary[:70]}")
+    return 0
+
+
+def cmd_smithy_describe(args: argparse.Namespace) -> int:
+    api = _smithy_or_exit(Path(args.package))
+    if args.operation not in api.operations:
+        sys.exit(f"no operation {args.operation}")
+    print(json.dumps(api.describe(args.operation), indent=2))
+    return 0
+
+
+def cmd_smithy_validate(args: argparse.Namespace) -> int:
+    from ogrl_integration import smithy
+
+    api = _smithy_or_exit(Path(args.package))
+    definition = _need("yaml").safe_load(Path(args.query).read_text())
+    problems, schema = smithy.validate(api, smithy.Query.from_json(definition), name=definition.get("name"))
+    for problem in problems:
+        print(f"{problem.pointer}: {problem.detail}", file=sys.stderr)
+    if not problems:
+        print(json.dumps(schema, indent=2))
+    return 1 if problems else 0
+
+
 # --- entry -------------------------------------------------------------------------------------
 
 
@@ -639,6 +732,27 @@ def main(argv: list[str] | None = None) -> int:
     api_search.add_argument("package")
     api_search.add_argument("text")
     api_search.set_defaults(func=cmd_openapi_search)
+
+    sm = sub.add_parser("smithy", help="query sources over AWS Smithy models (RFC 0007)")
+    sm_sub = sm.add_subparsers(dest="action", required=True)
+    sm_build = sm_sub.add_parser("build", help="write _ogrl_smithy.py: the trimmed models")
+    sm_build.add_argument("package")
+    sm_build.set_defaults(func=cmd_smithy_build)
+    sm_search = sm_sub.add_parser("search", help="find queryable operations by name or summary")
+    sm_search.add_argument("package")
+    sm_search.add_argument("text")
+    sm_search.add_argument("--limit", type=int, default=50)
+    sm_search.set_defaults(func=cmd_smithy_search)
+    sm_describe = sm_sub.add_parser(
+        "describe", help="an operation's parameters, item fields, and read status"
+    )
+    sm_describe.add_argument("package")
+    sm_describe.add_argument("operation", help="<service>.<Operation>, such as ec2.DescribeSecurityGroups")
+    sm_describe.set_defaults(func=cmd_smithy_describe)
+    sm_validate = sm_sub.add_parser("validate", help="statically validate a query definition (YAML)")
+    sm_validate.add_argument("package")
+    sm_validate.add_argument("query")
+    sm_validate.set_defaults(func=cmd_smithy_validate)
 
     test = sub.add_parser("test", help="run the conformance suite")
     test.add_argument("package")

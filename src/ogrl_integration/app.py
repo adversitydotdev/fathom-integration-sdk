@@ -227,21 +227,35 @@ class Integration:
             self._bundled = openapi.load_bundled()
         return self._bundled
 
+    def _smithy(self) -> Any:
+        if not hasattr(self, "_bundled_smithy"):
+            from ogrl_integration import smithy
+
+            self._bundled_smithy = smithy.load_bundled()
+        return self._bundled_smithy
+
+    def _query(self, spec: Mapping[str, Any]) -> Resource:
+        """A query source (OGRL RFC 0006 over OpenAPI, RFC 0007 over Smithy)."""
+        api = self._smithy()
+        if api is not None:
+            from ogrl_integration import smithy
+
+            query = smithy.Query.from_json(spec)
+            return lambda ctx: smithy.execute(ctx, api, query)
+        bundled = self._openapi()
+        if bundled is None:
+            raise InvalidConfig("this integration does not support query sources")
+        from ogrl_integration import openapi
+
+        settings, description = bundled
+        plain = openapi.Query.from_json(spec)
+        return lambda ctx: openapi.execute(ctx, description, settings, plain)
+
     def _collect(self, channel: _Channel, params: dict[str, Any]) -> dict[str, Any]:
         key = (params.get("resource"), int(params.get("version") or 0))
         ctx = self._context(channel, params, credentials=True)
-        if params.get("query") is not None:  # a query source (OGRL RFC 0006)
-            from ogrl_integration import openapi
-
-            bundled = self._openapi()
-            if bundled is None:
-                raise InvalidConfig("this integration does not support query sources")
-            settings, description = bundled
-            query = openapi.Query.from_json(params["query"])
-
-            def fn(ctx: Context) -> Iterable[Mapping[str, Any]]:
-                return openapi.execute(ctx, description, settings, query)
-
+        if params.get("query") is not None:
+            fn = self._query(params["query"])
         else:
             fn = self.resources.get(key)  # type: ignore[arg-type,assignment]
             if fn is None:

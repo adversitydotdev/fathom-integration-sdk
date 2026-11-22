@@ -141,8 +141,14 @@ class Http:
         json_body: Any = None,
         data: Mapping[str, str] | None = None,
         content: bytes | None = None,
+        throttled: Callable[[Response], bool] | None = None,
+        error_detail: Callable[[Response], str | None] | None = None,
     ) -> Response:
-        """`content` sends bytes as they are, for callers that sign the body (AWS SigV4)."""
+        """`content` sends bytes as they are, for callers that sign the body (AWS SigV4).
+
+        `throttled` marks vendor-specific rate limits (AWS answers 400 `Throttling`), which
+        are retried like 429; `error_detail` adds the vendor's error code and message.
+        """
         if params:
             query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
             url = f"{url}{'&' if urllib.parse.urlsplit(url).query else '?'}{query}"
@@ -159,22 +165,32 @@ class Http:
         attempt = 0
         while True:
             response = self.transport.send(request, self.timeout)
-            retryable = response.status in RETRY_STATUSES or _rate_limited(response)
+            limited = response.status >= 400 and throttled is not None and throttled(response)
+            retryable = response.status in RETRY_STATUSES or _rate_limited(response) or limited
             if not retryable or attempt >= self.retries:
                 break
             attempt += 1
             wait = _retry_after(response)
             self._sleep(min(wait if wait is not None else 2 ** (attempt - 1), 60))
-        return self._raise_for(request, response)
+        return self._raise_for(request, response, throttled, error_detail)
 
-    def _raise_for(self, request: Request, response: Response) -> Response:
+    def _raise_for(
+        self,
+        request: Request,
+        response: Response,
+        throttled: Callable[[Response], bool] | None = None,
+        error_detail: Callable[[Response], str | None] | None = None,
+    ) -> Response:
         if response.status < 400:
             return response
         where = f"{request.method} {_redact(request.url)} answered {response.status}"
+        detail = error_detail(response) if error_detail else None
+        if detail:
+            where = f"{where}: {detail[:500]}"
         error: IntegrationError
         if response.status == 401:
             error = AuthFailed(where)
-        elif _rate_limited(response):
+        elif _rate_limited(response) or (throttled is not None and throttled(response)):
             error = RateLimited(where, _retry_after(response))
         elif response.status == 403:
             error = PermissionDenied(where)
