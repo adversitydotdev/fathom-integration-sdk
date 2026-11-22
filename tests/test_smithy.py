@@ -352,6 +352,7 @@ S3 = {
                 "MaxBuckets": m("smithy.api#Integer", **{"smithy.api#httpQuery": "max-buckets"}),
                 "ContinuationToken": m(S, **{"smithy.api#httpQuery": "continuation-token"}),
                 "Prefix": m(S, **{"smithy.api#httpQuery": "prefix"}),
+                "BucketRegion": m(S, **{"smithy.api#httpQuery": "bucket-region"}),
             }
         ),
         "com.amazonaws.s3#ListBucketsOutput": structure(
@@ -515,7 +516,7 @@ def test_feedback_points_at_the_problem(api):
         "/params/NextToken": "NextToken is the paginator's; leave it out",
         "/params/DryRun": "DryRun is true or false",
         "/fields/id": "items have no 'GroupID'; did you mean 'GroupId' or 'GroupName'?",
-        "/fields/region": "region is added to every item of a regional query",
+        "/fields/region": "region is added to every item of this query",
     }
     assert check(api, smithy.Query("ec2.DescribeSecurityGroups", params={"Filters": "[{"}))[0][
         "/params/Filters"
@@ -671,6 +672,12 @@ class FakeAws:
                 "<BucketRegion>us-east-1</BucketRegion></Bucket></Buckets>"
                 "<ContinuationToken>c2</ContinuationToken></ListAllMyBucketsResult>"
             )
+        elif url.path == "/logs" and url.query == "encryption=":
+            body = (
+                "<Error><Code>ServerSideEncryptionConfigurationNotFoundError</Code>"
+                "<Message>The server side encryption configuration was not found</Message></Error>"
+            )
+            return Response(404, {}, body.encode())
         elif url.query == "encryption=":
             body = (
                 '<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
@@ -712,6 +719,7 @@ def collect(query: smithy.Query, config=None, aws=None, **extra):
         "items": query.items,
         "fields": query.fields,
         "regions": query.regions,
+        **({"for_each": query.for_each.__dict__} if query.for_each else {}),
         **extra,
     }
     return Harness(app).collect(
@@ -923,3 +931,94 @@ def test_rest_xml_reads_s3(bundled, api):
         regions=["us-east-1"],
     )
     assert collect(policy)[0].items[0]["policy"].startswith('{"Version"')
+
+
+ENCRYPTION = smithy.Query(
+    "s3.GetBucketEncryption",
+    fields={
+        "id": "$parent.Name",
+        "name": "$parent.Name",
+        "created": "$parent.CreationDate",
+        "rules": "ServerSideEncryptionConfiguration.Rules",
+    },
+    regions=["us-east-1"],
+    for_each=smithy.ForEach("s3.ListBuckets", bind={"Bucket": "Name"}, params={"BucketRegion": "$region"}),
+)
+
+
+def test_for_each_validates_both_calls(api):
+    problems, schema = check(api, ENCRYPTION)
+    assert problems == {}
+    assert schema["required"] == ["created", "error", "id", "name", "region", "rules"]
+    assert schema["properties"]["error"] == {"type": ["string", "null"]}
+    assert schema["properties"]["rules"] == {"type": ["array", "null"]}
+    assert schema["properties"]["created"] == {"type": ["string", "null"]}
+
+    def problems_with(**changes):
+        fe = {**ENCRYPTION.for_each.__dict__, **changes.pop("for_each", {})}
+        query = smithy.Query(**{**ENCRYPTION.__dict__, **changes, "for_each": smithy.ForEach(**fe)})
+        return check(api, query)[0]
+
+    assert problems_with(for_each={"bind": {"Bucket": "Nme"}}) == {
+        "/for_each/bind/Bucket": "items have no 'Nme'; did you mean 'Name'?"
+    }
+    assert problems_with(params={"Bucket": "x"}) == {
+        "/params/Bucket": "for_each binds Bucket; leave it out of params"
+    }
+    assert problems_with(for_each={"operation": "s3.GetBucketLocation", "params": {"Bucket": "x"}}) == {
+        "/for_each/items": "s3.GetBucketLocation returns one result; name its list"
+    }
+    assert (
+        "list from s3"
+        in problems_with(for_each={"operation": "kms.ListKeys", "params": {}})["/for_each/operation"]
+    )
+    assert problems_with(for_each={"limit": 0}) == {"/for_each/limit": "between 1 and 5000"}
+    plain = smithy.Query(
+        "s3.ListBuckets", fields={"id": "$parent.Name", "name": "Name"}, regions=["us-east-1"]
+    )
+    assert check(api, plain)[0] == {"/fields/id": "$parent reads the listed item of a for_each query"}
+    global_region = smithy.Query(
+        "iam.ListRoles", params={"PathPrefix": "$region"}, fields={"id": "RoleId", "name": "RoleName"}
+    )
+    assert check(api, global_region)[0] == {"/params/PathPrefix": "iam is global: there is no $region"}
+
+
+def test_for_each_calls_once_per_listed_item(bundled):
+    out, aws = collect(ENCRYPTION)
+    assert out.complete
+    assert out.items == [
+        {
+            "id": "data",
+            "name": "data",
+            "created": "2024-01-01T00:00:00Z",
+            "rules": [
+                {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}, "BucketKeyEnabled": True}
+            ],
+            "region": "us-east-1",
+            "error": None,
+        },
+        {
+            "id": "logs",
+            "name": "logs",
+            "created": None,
+            "rules": None,
+            "region": "us-east-1",
+            "error": "ServerSideEncryptionConfigurationNotFoundError",
+        },
+    ]
+    urls = [r.url.split("amazonaws.com", 1)[1] for r in aws.requests]
+    assert urls == [
+        "/?x-id=ListBuckets&bucket-region=us-east-1",
+        "/data?encryption=",
+        "/?x-id=ListBuckets&bucket-region=us-east-1&continuation-token=c2",
+        "/logs?encryption=",
+    ]
+
+
+def test_for_each_limit_makes_the_collection_incomplete(bundled):
+    limited = smithy.Query(
+        **{**ENCRYPTION.__dict__, "for_each": smithy.ForEach(**{**ENCRYPTION.for_each.__dict__, "limit": 1})}
+    )
+    out, _ = collect(limited)
+    assert [i["id"] for i in out.items] == ["data"]
+    assert (out.complete, out.reason) == (False, "us-east-1: s3.ListBuckets listed more than 1 items")

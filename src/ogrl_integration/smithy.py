@@ -28,6 +28,7 @@ from xml.etree import ElementTree
 
 from ogrl_integration import sigv4
 from ogrl_integration.errors import (
+    AuthFailed,
     Incomplete,
     IntegrationError,
     InvalidConfig,
@@ -45,7 +46,8 @@ REST = ("restJson1", "restXml")
 READ_PREFIX = re.compile(r"^(List|Describe|Get)[A-Z]")
 REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d{1,2}$")
 MEMBER_PATH = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
-SELF, REGION_PATH = ".", "$region"
+SELF, REGION_PATH, PARENT_PREFIX = ".", "$region", "$parent."
+DEFAULT_LIMIT, MAX_LIMIT = 1000, 5000
 MAX_DEPTH = 6
 MAX_PAGES = 10_000
 THROTTLE_CODES = frozenset(
@@ -177,17 +179,40 @@ class Settings:
 
 
 @dataclass
+class ForEach:
+    """Call `operation` once per item a list operation returns (RFC 0007 section 4)."""
+
+    operation: str
+    bind: dict[str, str]  # operation parameter -> path in each listed item
+    params: dict[str, str] = field(default_factory=dict)
+    items: str = ""
+    limit: int = DEFAULT_LIMIT
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "ForEach":
+        return cls(
+            operation=str(data.get("operation") or ""),
+            bind={str(k): str(v) for k, v in (data.get("bind") or {}).items()},
+            params={str(k): str(v) for k, v in (data.get("params") or {}).items()},
+            items=str(data.get("items") or ""),
+            limit=int(data.get("limit") or DEFAULT_LIMIT),
+        )
+
+
+@dataclass
 class Query(_OpenApiQuery):
-    """RFC 0006's definition plus `regions`: region codes, or "*" for the connection's."""
+    """RFC 0006's definition plus `regions` (codes, or "*" for the connection's) and `for_each`."""
 
     regions: list[str] | str = field(default_factory=list)
+    for_each: ForEach | None = None
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> "Query":
         base = _OpenApiQuery.from_json(data)
         raw = data.get("regions") or []
         regions: list[str] | str = raw if isinstance(raw, str) else [str(r) for r in raw]
-        return cls(base.operation, base.params, base.items, base.fields, base.max_items, regions)
+        for_each = ForEach.from_json(data["for_each"]) if data.get("for_each") else None
+        return cls(base.operation, base.params, base.items, base.fields, base.max_items, regions, for_each)
 
 
 # --- models -----------------------------------------------------------------------------------
@@ -581,6 +606,168 @@ def _regions(query: Query, config: Mapping[str, str]) -> list[str]:
     return list(query.regions)
 
 
+def _find_operation(api: Api, name: str, pointer: str, problems: list[Problem]) -> Operation | None:
+    op = api.operations.get(name)
+    if op is None:
+        service, _, bare = name.partition(".")
+        if not bare or service not in api.models:
+            detail = (
+                f"name an operation as <service>.<Operation>, with service one of {', '.join(api.models)}"
+            )
+        else:
+            known = [n for n, o in api.operations.items() if o.service == service and o.readable]
+            close = difflib.get_close_matches(name, known, n=3, cutoff=0.6)
+            hint = f"did you mean {' or '.join(repr(c) for c in close)}?" if close else "search for one"
+            detail = f"no queryable operation {name!r}; {hint}"
+        problems.append(Problem(pointer, detail))
+        return None
+    if not op.readable:
+        problems.append(Problem(pointer, op.reason))
+        return None
+    return op
+
+
+def _check_params(
+    model: Model,
+    op: Operation,
+    params: Mapping[str, str],
+    prefix: str,
+    regional: bool,
+    bound: set[str],
+) -> list[Problem]:
+    """RFC 0007 section 4 input rules; `bound` parameters are filled per item by for_each."""
+    problems: list[Problem] = []
+    members = model.members(op.input)
+    reserved = _reserved_inputs(op)
+    for key, value in params.items():
+        pointer = f"{prefix}/{key}"
+        if key not in members:
+            problems.append(
+                Problem(pointer, f"{op.name} has no parameter {key!r}; {_hint(key, list(members))}")
+            )
+            continue
+        target, traits = members[key]
+        if key in reserved:
+            problems.append(Problem(pointer, f"{key} is the paginator's; leave it out"))
+            continue
+        if key in bound:
+            problems.append(Problem(pointer, f"for_each binds {key}; leave it out of params"))
+            continue
+        if _bound_elsewhere(traits):
+            problems.append(
+                Problem(pointer, f"{key} is sent as a header or payload, which queries cannot set")
+            )
+            continue
+        if len(value) > MAX_PARAM:
+            problems.append(Problem(pointer, f"longer than {MAX_PARAM} characters"))
+            continue
+        if value == REGION_PATH:
+            if not regional:
+                problems.append(Problem(pointer, f"{op.service} is global: there is no $region"))
+            elif model.kind(target) != "string":
+                problems.append(Problem(pointer, f"$region fills string parameters; {key} is not one"))
+            continue
+        typed, error = _coerce(model, target, value)
+        if error:
+            problems.append(Problem(pointer, f"{key} {error}"))
+            continue
+        if "smithy.api#httpLabel" in traits and ("/" in value or value in ("", ".", "..")):
+            problems.append(Problem(pointer, "a path parameter cannot contain / or be empty"))
+        for detail in check_value(model, target, typed, key):
+            problems.append(Problem(pointer, detail))
+    for key, (_, traits) in members.items():
+        if "smithy.api#required" in traits and key not in params and key not in reserved | bound:
+            problems.append(Problem(f"{prefix}/{key}", f"{op.name} needs {key}"))
+    if op.protocol in REST and op.method == "GET":
+        for key in params:
+            if key in members and not any(
+                t in members[key][1] for t in ("smithy.api#httpLabel", "smithy.api#httpQuery")
+            ):
+                problems.append(Problem(f"{prefix}/{key}", f"{key} is not sent by GET {op.uri}"))
+    return problems
+
+
+def _check_items(
+    api: Api, model: Model, op: Operation, items: str, pointer: str, problems: list[Problem]
+) -> tuple[str | None, str]:
+    if items and not MEMBER_PATH.match(items):
+        problems.append(Problem(pointer, "a dotted path of member names, or empty"))
+        return None, items
+    item, path = _items_target(model, op, items)
+    if item is None:
+        output_members = [f["path"] for f in api.fields_of(model, op.output)]
+        if _member_at(model, op.output, path)[0] is None:
+            problems.append(Problem(pointer, f"the output has no {path!r}; {_hint(path, output_members)}"))
+        else:
+            problems.append(Problem(pointer, f"{path!r} is not a list"))
+    return item, path
+
+
+def _field_type(
+    api: Api, model: Model, item: str, path: str, pointer: str, problems: list[Problem]
+) -> dict[str, Any] | None:
+    """The schema of a projected member path, or None after recording why it is wrong."""
+    structured = model.kind(item) in ("structure", "union")
+    if path == SELF:
+        if structured:
+            problems.append(Problem(pointer, "'.' is the item itself, for lists of strings or numbers"))
+            return None
+        return {"type": [_json_kind(model.kind(item))]}
+    if not MEMBER_PATH.match(path):
+        problems.append(Problem(pointer, "a dotted path of member names, such as Placement.Tenancy"))
+        return None
+    if not structured:
+        problems.append(Problem(pointer, f"items are {_describe(model, item)}; project them with '.'"))
+        return None
+    target, required = _member_at(model, item, path)
+    if target is None:
+        known = [f["path"] for f in api.fields_of(model, item)]
+        problems.append(Problem(pointer, f"items have no {path!r}; {_hint(path, known)}"))
+        return None
+    kind = _json_kind(model.kind(target))
+    return {"type": [kind] if required else [kind, "null"]}
+
+
+def _check_for_each(
+    api: Api, model: Model, op: Operation, query: Query, regional: bool, problems: list[Problem]
+) -> str | None:
+    """Section 4 per-item calls; returns the listed item shape when valid."""
+    fe = query.for_each
+    assert fe is not None
+    parent = _find_operation(api, fe.operation, "/for_each/operation", problems)
+    if parent is None:
+        return None
+    if parent.service != op.service:
+        problems.append(
+            Problem("/for_each/operation", f"list from {op.service}, the service {op.name} is in")
+        )
+        return None
+    if not (1 <= fe.limit <= MAX_LIMIT):
+        problems.append(Problem("/for_each/limit", f"between 1 and {MAX_LIMIT}"))
+    problems += _check_params(model, parent, fe.params, "/for_each/params", regional, set())
+    item, path = _check_items(api, model, parent, fe.items, "/for_each/items", problems)
+    if item is None:
+        return None
+    if not path:
+        problems.append(Problem("/for_each/items", f"{parent.name} returns one result; name its list"))
+        return None
+    members = model.members(op.input)
+    if not fe.bind:
+        problems.append(Problem("/for_each/bind", f"bind at least one parameter of {op.name}"))
+    for key, item_path in fe.bind.items():
+        pointer = f"/for_each/bind/{key}"
+        if key not in members:
+            problems.append(
+                Problem(pointer, f"{op.name} has no parameter {key!r}; {_hint(key, list(members))}")
+            )
+            continue
+        if model.kind(members[key][0]) not in SCALARS or _bound_elsewhere(members[key][1]):
+            problems.append(Problem(pointer, f"{key} cannot be bound: bind scalar parameters"))
+            continue
+        _field_type(api, model, item, item_path, pointer, problems)
+    return item
+
+
 def validate(
     api: Api, query: Query, *, name: str | None = None
 ) -> tuple[list[Problem], dict[str, Any] | None]:
@@ -588,22 +775,8 @@ def validate(
     problems: list[Problem] = []
     if name is not None and not QUERY_NAME.match(name):
         problems.append(Problem("/name", "a name matches [a-z0-9-]+"))
-    op = api.operations.get(query.operation)
+    op = _find_operation(api, query.operation, "/operation", problems)
     if op is None:
-        service, _, bare = query.operation.partition(".")
-        if not bare or service not in api.models:
-            detail = (
-                f"name an operation as <service>.<Operation>, with service one of {', '.join(api.models)}"
-            )
-        else:
-            known = [n for n, o in api.operations.items() if o.service == service and o.readable]
-            close = difflib.get_close_matches(query.operation, known, n=3, cutoff=0.6)
-            hint = f"did you mean {' or '.join(repr(c) for c in close)}?" if close else "search for one"
-            detail = f"no queryable operation {query.operation!r}; {hint}"
-        problems.append(Problem("/operation", detail))
-        return problems, None
-    if not op.readable:
-        problems.append(Problem("/operation", op.reason))
         return problems, None
     model = api.model(op)
     service = api.settings.services.get(op.service)
@@ -625,57 +798,16 @@ def validate(
     if not service.regional and query.regions:
         problems.append(Problem("/regions", f"{op.service} is global: leave regions out"))
 
-    # Parameters.
-    members = model.members(op.input)
-    reserved = _reserved_inputs(op)
-    for key, value in query.params.items():
-        pointer = f"/params/{key}"
-        if key not in members:
-            problems.append(
-                Problem(pointer, f"{op.name} has no parameter {key!r}; {_hint(key, list(members))}")
-            )
-            continue
-        target, traits = members[key]
-        if key in reserved:
-            problems.append(Problem(pointer, f"{key} is the paginator's; leave it out"))
-            continue
-        if _bound_elsewhere(traits):
-            problems.append(
-                Problem(pointer, f"{key} is sent as a header or payload, which queries cannot set")
-            )
-            continue
-        if len(value) > MAX_PARAM:
-            problems.append(Problem(pointer, f"longer than {MAX_PARAM} characters"))
-            continue
-        typed, error = _coerce(model, target, value)
-        if error:
-            problems.append(Problem(pointer, f"{key} {error}"))
-            continue
-        if "smithy.api#httpLabel" in traits and ("/" in value or value in ("", ".", "..")):
-            problems.append(Problem(pointer, "a path parameter cannot contain / or be empty"))
-        for detail in check_value(model, target, typed, key):
-            problems.append(Problem(pointer, detail))
-    for key, (_, traits) in members.items():
-        if "smithy.api#required" in traits and key not in query.params and key not in reserved:
-            problems.append(Problem(f"/params/{key}", f"{op.name} needs {key}"))
-    if op.protocol in REST and op.method == "GET":
-        for key in query.params:
-            if key in members and not any(
-                t in members[key][1] for t in ("smithy.api#httpLabel", "smithy.api#httpQuery")
-            ):
-                problems.append(Problem(f"/params/{key}", f"{key} is not sent by GET {op.uri}"))
+    # Per-item calls, then parameters.
+    parent_item = None
+    if query.for_each is not None:
+        parent_item = _check_for_each(api, model, op, query, service.regional, problems)
+    bound = set(query.for_each.bind) if query.for_each else set()
+    problems += _check_params(model, op, query.params, "/params", service.regional, bound)
 
     # Items.
-    if query.items and not MEMBER_PATH.match(query.items):
-        problems.append(Problem("/items", "a dotted path of member names, or empty"))
-        return problems, None
-    item, path = _items_target(model, op, query.items)
+    item, _ = _check_items(api, model, op, query.items, "/items", problems)
     if item is None:
-        output_members = [f["path"] for f in api.fields_of(model, op.output)]
-        if _member_at(model, op.output, path)[0] is None:
-            problems.append(Problem("/items", f"the output has no {path!r}; {_hint(path, output_members)}"))
-        else:
-            problems.append(Problem("/items", f"{path!r} is not a list"))
         return problems, None
 
     # Fields.
@@ -685,15 +817,14 @@ def validate(
         if query.fields and required not in query.fields:
             problems.append(Problem(f"/fields/{required}", f"{required} is required: it names failing items"))
     properties: dict[str, Any] = {}
-    structured = model.kind(item) in ("structure", "union")
-    known = [f["path"] for f in api.fields_of(model, item)]
+    added = [*(["region"] if service.regional else []), *(["error"] if query.for_each else [])]
     for key, member_path in query.fields.items():
         pointer = f"/fields/{key}"
         if not FIELD_NAME.match(key):
             problems.append(Problem(pointer, "output field names match [a-z][a-z0-9_]*"))
             continue
-        if key == "region" and service.regional:
-            problems.append(Problem(pointer, "region is added to every item of a regional query"))
+        if key in added:
+            problems.append(Problem(pointer, f"{key} is added to every item of this query"))
             continue
         if member_path == REGION_PATH:
             if not service.regional:
@@ -701,29 +832,30 @@ def validate(
                 continue
             properties[key] = {"type": ["string"]}
             continue
-        if member_path == SELF:
-            if structured:
-                problems.append(Problem(pointer, "'.' is the item itself, for lists of strings or numbers"))
+        if member_path.startswith(PARENT_PREFIX):
+            if query.for_each is None:
+                problems.append(Problem(pointer, "$parent reads the listed item of a for_each query"))
                 continue
-            properties[key] = {"type": [_json_kind(model.kind(item))]}
+            if parent_item is not None:
+                found = _field_type(
+                    api, model, parent_item, member_path[len(PARENT_PREFIX) :], pointer, problems
+                )
+                if found is not None:
+                    properties[key] = found
             continue
-        if not MEMBER_PATH.match(member_path):
-            problems.append(Problem(pointer, "a dotted path of member names, such as Placement.Tenancy"))
+        found = _field_type(api, model, item, member_path, pointer, problems)
+        if found is None:
             continue
-        if not structured:
-            problems.append(Problem(pointer, f"items are {_describe(model, item)}; project them with '.'"))
-            continue
-        target, required = _member_at(model, item, member_path)
-        if target is None:
-            problems.append(Problem(pointer, f"items have no {member_path!r}; {_hint(member_path, known)}"))
-            continue
-        kind = _json_kind(model.kind(target))
-        properties[key] = {"type": [kind] if required else [kind, "null"]}
+        if query.for_each is not None and "null" not in found["type"]:
+            found = {"type": [*found["type"], "null"]}  # empty when the call failed
+        properties[key] = found
     if service.regional:
         properties["region"] = {"type": ["string"]}
+    if query.for_each is not None:
+        properties["error"] = {"type": ["string", "null"]}
     schema = {
         "type": "object",
-        "required": sorted({*query.fields, *(["region"] if service.regional else [])}),
+        "required": sorted({*query.fields, *added}),
         "properties": properties,
     }
     return problems, schema
@@ -1111,7 +1243,14 @@ def _send(ctx: Any, call: _Call, region: str, signing_name: str) -> Any:
         raise
 
 
-def _pages(ctx: Any, api: Api, op: Operation, query: Query, region: str | None) -> Iterator[Any]:
+def _pages(
+    ctx: Any,
+    api: Api,
+    op: Operation,
+    params: Mapping[str, str],
+    items: str,
+    region: str | None,
+) -> Iterator[Any]:
     model = api.model(op)
     service = api.settings.services[op.service]
     endpoint = service.endpoint.replace("{region}", region) if region else service.endpoint
@@ -1119,8 +1258,11 @@ def _pages(ctx: Any, api: Api, op: Operation, query: Query, region: str | None) 
     if parts.scheme != "https" and parts.hostname not in ("localhost", "127.0.0.1"):
         raise InvalidConfig(f"{endpoint} is not an https URL")
     members = model.members(op.input)
-    values = {key: _coerce(model, members[key][0], text)[0] for key, text in query.params.items()}
-    _, items_path = _items_target(model, op, query.items)
+    values = {
+        key: region if text == REGION_PATH else _coerce(model, members[key][0], text)[0]
+        for key, text in params.items()
+    }
+    _, items_path = _items_target(model, op, items)
     signing_region = region or service.signing_region
     token, seen = None, set()
     for _ in range(MAX_PAGES):
@@ -1144,13 +1286,25 @@ def _pages(ctx: Any, api: Api, op: Operation, query: Query, region: str | None) 
     raise IntegrationError(f"{op.name}: more than {MAX_PAGES} pages")
 
 
-def _project(raw: Any, fields: Mapping[str, str], region: str | None) -> dict[str, Any]:
+def _project(
+    raw: Any,
+    fields: Mapping[str, str],
+    region: str | None,
+    parent: Any = None,
+    error: str | None = None,
+    per_item: bool = False,
+) -> dict[str, Any]:
     projected: dict[str, Any] = {}
     for key, path in fields.items():
-        if path == SELF:
-            projected[key] = raw
-        elif path == REGION_PATH:
+        if path == REGION_PATH:
             projected[key] = region
+        elif path.startswith(PARENT_PREFIX):
+            rest = path[len(PARENT_PREFIX) :]
+            projected[key] = parent if rest == SELF else _get(parent, rest)
+        elif raw is None:
+            projected[key] = None
+        elif path == SELF:
+            projected[key] = raw
         else:
             projected[key] = _get(raw, path)
     for key in ("id", "name"):
@@ -1158,7 +1312,50 @@ def _project(raw: Any, fields: Mapping[str, str], region: str | None) -> dict[st
             projected[key] = str(projected[key])
     if region:
         projected["region"] = region
+    if per_item:
+        projected["error"] = error
     return projected
+
+
+def _aws_code(exc: IntegrationError) -> str:
+    found = re.search(r"answered \d+: ([A-Za-z0-9_.]+)", exc.message)
+    return found.group(1) if found else f"HTTP {exc.status or 'error'}"
+
+
+class _LimitReached(Exception):
+    pass
+
+
+def _items_in(
+    ctx: Any, api: Api, op: Operation, query: Query, region: str | None
+) -> Iterator[dict[str, Any]]:
+    """One region's projected items: one call, or one per listed item with for_each."""
+    fe = query.for_each
+    if fe is None:
+        for raw in _pages(ctx, api, op, query.params, query.items, region):
+            yield _project(raw, query.fields, region)
+        return
+    parent_op = api.operations[fe.operation]
+    for count, parent in enumerate(_pages(ctx, api, parent_op, fe.params, fe.items, region), 1):
+        if count > fe.limit:
+            raise _LimitReached(f"{fe.operation} listed more than {fe.limit} items")
+        bound: dict[str, str] = {}
+        for key, path in fe.bind.items():
+            value = parent if path == SELF else _get(parent, path)
+            if value is not None:
+                bound[key] = value if isinstance(value, str) else json.dumps(value)
+        if len(bound) < len(fe.bind):
+            yield _project(None, query.fields, region, parent, "MissingParentValue", True)
+            continue
+        try:
+            for raw in _pages(ctx, api, op, {**query.params, **bound}, query.items, region):
+                yield _project(raw, query.fields, region, parent, None, True)
+        except (AuthFailed, PermissionDenied, RateLimited):
+            raise
+        except IntegrationError as exc:
+            if exc.status is None or not 400 <= exc.status < 500:
+                raise
+            yield _project(None, query.fields, region, parent, _aws_code(exc), True)
 
 
 def execute(ctx: Any, api: Api, query: Query) -> Iterator[dict[str, Any]]:
@@ -1184,18 +1381,21 @@ def execute(ctx: Any, api: Api, query: Query) -> Iterator[dict[str, Any]]:
 
     def run() -> Iterator[dict[str, Any]]:
         failures: list[tuple[str | None, IntegrationError]] = []
+        notes: list[str] = []
         for region in regions:
             try:
-                for raw in _pages(ctx, api, op, query, region):
-                    yield _project(raw, query.fields, region)
+                yield from _items_in(ctx, api, op, query, region)
             except RateLimited:
                 raise
             except IntegrationError as exc:
                 failures.append((region, exc))
+            except _LimitReached as exc:
+                notes.append(f"{region}: {exc}" if region else str(exc))
         if failures and len(failures) == len(regions):
             raise failures[0][1]
-        if failures:
-            raise Incomplete("; ".join(f"{region}: {exc.message}" for region, exc in failures))
+        reasons = [f"{region}: {exc.message}" if region else exc.message for region, exc in failures]
+        if failures or notes:
+            raise Incomplete("; ".join([*reasons, *notes]))
 
     produced: Iterator[dict[str, Any]] = run()
     if query.max_items is not None:

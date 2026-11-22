@@ -182,7 +182,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             query = None
             if args.query:
                 definition = _need("yaml").safe_load(Path(args.query).read_text())
-                keys = ("operation", "params", "items", "fields", "regions")
+                keys = ("operation", "params", "items", "fields", "regions", "for_each")
                 query = {k: definition[k] for k in keys if k in definition}
             result = harness.collect(name, major, config, _secrets(manifest), query=query)
             lines = "".join(json.dumps(item) + "\n" for item in result.items)
