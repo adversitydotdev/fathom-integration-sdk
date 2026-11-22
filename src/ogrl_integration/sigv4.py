@@ -40,6 +40,8 @@ def sign(
     signed = {**headers, "Host": parts.netloc, "X-Amz-Date": amz_date}
     if session_token:
         signed["X-Amz-Security-Token"] = session_token
+    if service == "s3":  # S3 requires the payload hash as a header
+        signed["X-Amz-Content-Sha256"] = hashlib.sha256(body).hexdigest()
 
     canonical_headers = {k.lower(): " ".join(v.split()) for k, v in signed.items()}
     names = sorted(canonical_headers)
@@ -47,7 +49,8 @@ def sign(
     canonical = "\n".join(
         [
             method.upper(),
-            quote(parts.path or "/", safe="/-_.~"),
+            # S3 signs the path as sent; every other service encodes it once more.
+            (parts.path or "/") if service == "s3" else quote(parts.path or "/", safe="/-_.~"),
             "&".join(f"{k}={v}" for k, v in query),
             "".join(f"{name}:{canonical_headers[name]}\n" for name in names),
             ";".join(names),

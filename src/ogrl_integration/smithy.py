@@ -40,7 +40,7 @@ from ogrl_integration.openapi import Query as _OpenApiQuery
 
 GENERATED_MODULE = "_ogrl_smithy"
 PROTOCOLS = ("awsJson1_0", "awsJson1_1", "restJson1", "awsQuery", "ec2Query", "restXml")
-SUPPORTED = ("awsJson1_0", "awsJson1_1", "restJson1", "awsQuery", "ec2Query")
+SUPPORTED = PROTOCOLS
 REST = ("restJson1", "restXml")
 READ_PREFIX = re.compile(r"^(List|Describe|Get)[A-Z]")
 REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d{1,2}$")
@@ -111,6 +111,7 @@ KEPT_TRAITS = frozenset(
         "smithy.api#enumValue",
         "smithy.api#title",
         "aws.protocols#ec2QueryName",
+        "aws.customizations#s3UnwrappedXmlOutput",
         "aws.auth#sigv4",
         "aws.api#service",
         *(f"aws.protocols#{p}" for p in PROTOCOLS),
@@ -1019,7 +1020,7 @@ def _request(api: Api, op: Operation, endpoint: str, values: dict[str, Any]) -> 
             _to_form(model, op.input, values, "", form, protocol == "ec2Query")
         headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8", "Accept": "text/xml"}
         return _Call("POST", base + "/", headers, urlencode(form).encode())
-    if protocol == "restJson1":
+    if protocol in REST:
         members = model.members(op.input)
         path, _, literal = op.uri.partition("?")
         query: list[tuple[str, str]] = [
@@ -1037,7 +1038,8 @@ def _request(api: Api, op: Operation, endpoint: str, values: dict[str, Any]) -> 
                 item_target = model.item(target)[0] if isinstance(value, list) else target
                 query += [(name, _form_scalar(model, item_target, v)) for v in items]
         url = base + path + (f"?{urlencode(query)}" if query else "")
-        return _Call(op.method, url, {"Accept": "application/json"}, b"")
+        accept = "application/json" if protocol == "restJson1" else "application/xml"
+        return _Call(op.method, url, {"Accept": accept}, b"")
     raise InvalidConfig(f"{op.protocol} is not supported")
 
 
@@ -1051,10 +1053,34 @@ def _response(api: Api, op: Operation, response: Any) -> dict[str, Any]:
             if payload:
                 return {payload: _from_json(model, members[payload][0], data, True)}
         return _from_json(model, op.output, data, op.protocol == "restJson1")
+    if op.protocol == "restXml":
+        return _rest_xml(model, op, response.body)
     root = ElementTree.fromstring(response.body)  # noqa: S314 - AWS responses; no DTDs or entities are resolved
     if op.protocol == "awsQuery":
         wrapper = next((c for c in root if _local(c.tag) == f"{op.name.split('.', 1)[1]}Result"), None)
         return _from_xml(model, op.output, wrapper) if wrapper is not None else {}
+    return _from_xml(model, op.output, root)
+
+
+def _rest_xml(model: Model, op: Operation, body: bytes) -> dict[str, Any]:
+    """restXml: the output structure is the root element, or one member is the whole payload."""
+    members = model.members(op.output)
+    payload = next((k for k, (_, t) in members.items() if "smithy.api#httpPayload" in t), None)
+    if payload is not None:
+        target = members[payload][0]
+        if model.kind(target) in ("string", "blob", "document"):  # such as a bucket policy's JSON
+            return {payload: body.decode(errors="replace")}
+        if not body.strip():
+            return {}
+        root = ElementTree.fromstring(body)  # noqa: S314 - AWS responses; no DTDs or entities are resolved
+        return {payload: _from_xml(model, target, root)}
+    if not body.strip():
+        return {}
+    root = ElementTree.fromstring(body)  # noqa: S314
+    if "aws.customizations#s3UnwrappedXmlOutput" in model.traits(op.shape_id):
+        # S3's GetBucketLocation: the root element is the output's only member.
+        (name, (target, _)), *_ = members.items()
+        return {name: _xml_scalar(model, target, root.text)}
     return _from_xml(model, op.output, root)
 
 

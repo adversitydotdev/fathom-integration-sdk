@@ -4,6 +4,7 @@ The models below are minimal excerpts shaped like `aws/api-models-aws`; the fake
 answers with bodies shaped like the real services' responses.
 """
 
+import hashlib
 import json
 import sys
 from urllib.parse import parse_qsl, urlsplit
@@ -313,17 +314,137 @@ GUARDDUTY = {
     },
 }
 
+
+S3 = {
+    "smithy": "2.0",
+    "shapes": {
+        "com.amazonaws.s3#AmazonS3": {
+            "type": "service",
+            "version": "2006-03-01",
+            "operations": [
+                {"target": f"com.amazonaws.s3#{name}"}
+                for name in (
+                    "ListBuckets",
+                    "GetBucketEncryption",
+                    "GetBucketLocation",
+                    "GetBucketPolicy",
+                    "PutBucketPolicy",
+                )
+            ],
+            "traits": {"aws.protocols#restXml": {}, "aws.auth#sigv4": {"name": "s3"}},
+        },
+        "com.amazonaws.s3#ListBuckets": {
+            "type": "operation",
+            "input": {"target": "com.amazonaws.s3#ListBucketsRequest"},
+            "output": {"target": "com.amazonaws.s3#ListBucketsOutput"},
+            "traits": {
+                "smithy.api#http": {"method": "GET", "uri": "/?x-id=ListBuckets", "code": 200},
+                "smithy.api#paginated": {
+                    "inputToken": "ContinuationToken",
+                    "outputToken": "ContinuationToken",
+                    "items": "Buckets",
+                    "pageSize": "MaxBuckets",
+                },
+            },
+        },
+        "com.amazonaws.s3#ListBucketsRequest": structure(
+            {
+                "MaxBuckets": m("smithy.api#Integer", **{"smithy.api#httpQuery": "max-buckets"}),
+                "ContinuationToken": m(S, **{"smithy.api#httpQuery": "continuation-token"}),
+                "Prefix": m(S, **{"smithy.api#httpQuery": "prefix"}),
+            }
+        ),
+        "com.amazonaws.s3#ListBucketsOutput": structure(
+            {"Buckets": m("com.amazonaws.s3#Buckets"), "ContinuationToken": m(S)},
+            **{"smithy.api#xmlName": "ListAllMyBucketsResult"},
+        ),
+        "com.amazonaws.s3#Buckets": {
+            "type": "list",
+            "member": m("com.amazonaws.s3#Bucket", **{"smithy.api#xmlName": "Bucket"}),
+        },
+        "com.amazonaws.s3#Bucket": structure(
+            {"Name": m(S), "CreationDate": m("smithy.api#Timestamp"), "BucketRegion": m(S)}
+        ),
+        "com.amazonaws.s3#BucketRequest": structure(
+            {
+                "Bucket": m(S, **{"smithy.api#httpLabel": {}, "smithy.api#required": {}}),
+                "ExpectedBucketOwner": m(S, **{"smithy.api#httpHeader": "x-amz-expected-bucket-owner"}),
+            }
+        ),
+        "com.amazonaws.s3#GetBucketEncryption": {
+            "type": "operation",
+            "input": {"target": "com.amazonaws.s3#BucketRequest"},
+            "output": {"target": "com.amazonaws.s3#GetBucketEncryptionOutput"},
+            "traits": {"smithy.api#http": {"method": "GET", "uri": "/{Bucket}?encryption", "code": 200}},
+        },
+        "com.amazonaws.s3#GetBucketEncryptionOutput": structure(
+            {
+                "ServerSideEncryptionConfiguration": m(
+                    "com.amazonaws.s3#ServerSideEncryptionConfiguration", **{"smithy.api#httpPayload": {}}
+                )
+            }
+        ),
+        "com.amazonaws.s3#ServerSideEncryptionConfiguration": structure(
+            {
+                "Rules": m(
+                    "com.amazonaws.s3#Rules",
+                    **{
+                        "smithy.api#xmlFlattened": {},
+                        "smithy.api#xmlName": "Rule",
+                        "smithy.api#required": {},
+                    },
+                )
+            }
+        ),
+        "com.amazonaws.s3#Rules": {"type": "list", "member": m("com.amazonaws.s3#Rule")},
+        "com.amazonaws.s3#Rule": structure(
+            {
+                "ApplyServerSideEncryptionByDefault": m("com.amazonaws.s3#Default"),
+                "BucketKeyEnabled": m("smithy.api#Boolean"),
+            }
+        ),
+        "com.amazonaws.s3#Default": structure({"SSEAlgorithm": m(S), "KMSMasterKeyID": m(S)}),
+        "com.amazonaws.s3#GetBucketLocation": {
+            "type": "operation",
+            "input": {"target": "com.amazonaws.s3#BucketRequest"},
+            "output": {"target": "com.amazonaws.s3#GetBucketLocationOutput"},
+            "traits": {
+                "aws.customizations#s3UnwrappedXmlOutput": {},
+                "smithy.api#http": {"method": "GET", "uri": "/{Bucket}?location", "code": 200},
+            },
+        },
+        "com.amazonaws.s3#GetBucketLocationOutput": structure(
+            {"LocationConstraint": m(S)}, **{"smithy.api#xmlName": "LocationConstraint"}
+        ),
+        "com.amazonaws.s3#GetBucketPolicy": {
+            "type": "operation",
+            "input": {"target": "com.amazonaws.s3#BucketRequest"},
+            "output": {"target": "com.amazonaws.s3#GetBucketPolicyOutput"},
+            "traits": {"smithy.api#http": {"method": "GET", "uri": "/{Bucket}?policy", "code": 200}},
+        },
+        "com.amazonaws.s3#GetBucketPolicyOutput": structure(
+            {"Policy": m(S, **{"smithy.api#httpPayload": {}})}
+        ),
+        "com.amazonaws.s3#PutBucketPolicy": {
+            "type": "operation",
+            "input": {"target": "com.amazonaws.s3#BucketRequest"},
+            "traits": {"smithy.api#http": {"method": "PUT", "uri": "/{Bucket}?policy", "code": 200}},
+        },
+    },
+}
+
 SETTINGS = smithy.Settings(
     services={
         "iam": smithy.Service("models/iam.json", "https://iam.amazonaws.com", signing_region="us-east-1"),
         "ec2": smithy.Service("models/ec2.json", "https://ec2.{region}.amazonaws.com"),
         "kms": smithy.Service("models/kms.json", "https://kms.{region}.amazonaws.com"),
         "guardduty": smithy.Service("models/guardduty.json", "https://guardduty.{region}.amazonaws.com"),
+        "s3": smithy.Service("models/s3.json", "https://s3.{region}.amazonaws.com"),
     },
     read_operations=("iam.GenerateCredentialReport",),
     deny_operations=("ec2.GetPasswordData",),
 )
-MODELS = {"iam": IAM, "ec2": EC2, "kms": KMS, "guardduty": GUARDDUTY}
+MODELS = {"iam": IAM, "ec2": EC2, "kms": KMS, "guardduty": GUARDDUTY, "s3": S3}
 OPEN_GROUPS = smithy.Query(
     operation="ec2.DescribeSecurityGroups",
     params={"Filters": '[{"Name": "ip-permission.cidr", "Values": ["0.0.0.0/0"]}]'},
@@ -486,6 +607,8 @@ class FakeAws:
             return self.iam(form)
         if host.startswith("kms."):
             return self.kms(json.loads(request.body or b"{}"))
+        if host.startswith("s3."):
+            return self.s3(request)
         return self.guardduty(request)
 
     def ec2(self, form):
@@ -532,6 +655,37 @@ class FakeAws:
             return Response(200, {}, json.dumps({"Keys": [{"KeyId": "k-2", "KeyArn": "arn:k2"}]}).encode())
         keys = [{"KeyId": "k-1", "KeyArn": "arn:k1", "Created": 1704067200}]
         return Response(200, {}, json.dumps({"Keys": keys, "NextMarker": "k2", "Truncated": True}).encode())
+
+    def s3(self, request):
+        assert request.headers["X-Amz-Content-Sha256"] == hashlib.sha256(b"").hexdigest()
+        url = urlsplit(request.url)
+        if url.path == "/" and "continuation-token=c2" in url.query:
+            body = (
+                "<ListAllMyBucketsResult><Buckets><Bucket><Name>logs</Name></Bucket></Buckets>"
+                "</ListAllMyBucketsResult>"
+            )
+        elif url.path == "/":
+            body = (
+                '<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Buckets>'
+                "<Bucket><Name>data</Name><CreationDate>2024-01-01T00:00:00.000Z</CreationDate>"
+                "<BucketRegion>us-east-1</BucketRegion></Bucket></Buckets>"
+                "<ContinuationToken>c2</ContinuationToken></ListAllMyBucketsResult>"
+            )
+        elif url.query == "encryption=":
+            body = (
+                '<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>"
+                "</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled></Rule>"
+                "</ServerSideEncryptionConfiguration>"
+            )
+        elif url.query == "location=":
+            body = (
+                '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                "eu-west-1</LocationConstraint>"
+            )
+        else:
+            body = '{"Version": "2012-10-17", "Statement": []}'
+        return Response(200, {}, body.encode())
 
     def guardduty(self, request):
         if "/detector/" in request.url:
@@ -721,3 +875,51 @@ def test_json_access_denied_is_a_permission_error(bundled):
         collect(keys, aws=Denied())
     assert caught.value.kind == "permission_denied"
     assert "AccessDeniedException: not authorized" in caught.value.error["message"]
+
+
+def test_rest_xml_reads_s3(bundled, api):
+    assert not api.operations["s3.PutBucketPolicy"].readable
+    buckets = smithy.Query(
+        "s3.ListBuckets",
+        fields={"id": "Name", "name": "Name", "created": "CreationDate", "home": "BucketRegion"},
+        regions=["us-east-1"],
+    )
+    out, aws = collect(buckets)
+    assert [(i["name"], i["created"]) for i in out.items] == [
+        ("data", "2024-01-01T00:00:00Z"),
+        ("logs", None),
+    ]
+    assert aws.requests[0].url == "https://s3.us-east-1.amazonaws.com/?x-id=ListBuckets"
+    assert "/us-east-1/s3/aws4_request" in aws.requests[0].headers["Authorization"]
+
+    encryption = smithy.Query(
+        "s3.GetBucketEncryption",
+        params={"Bucket": "data"},
+        fields={
+            "id": "$region",
+            "name": "$region",
+            "rules": "ServerSideEncryptionConfiguration.Rules",
+        },
+        regions=["us-east-1"],
+    )
+    out, aws = collect(encryption)
+    assert out.items[0]["rules"] == [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}, "BucketKeyEnabled": True}
+    ]
+    assert aws.requests[0].url == "https://s3.us-east-1.amazonaws.com/data?encryption="
+
+    location = smithy.Query(
+        "s3.GetBucketLocation",
+        params={"Bucket": "data"},
+        fields={"id": "$region", "name": "LocationConstraint"},
+        regions=["us-east-1"],
+    )
+    assert collect(location)[0].items[0]["name"] == "eu-west-1"
+
+    policy = smithy.Query(
+        "s3.GetBucketPolicy",
+        params={"Bucket": "data"},
+        fields={"id": "$region", "name": "$region", "policy": "Policy"},
+        regions=["us-east-1"],
+    )
+    assert collect(policy)[0].items[0]["policy"].startswith('{"Version"')
