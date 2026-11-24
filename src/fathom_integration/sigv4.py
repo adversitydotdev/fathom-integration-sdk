@@ -1,6 +1,6 @@
 """AWS Signature Version 4, on the standard library (the SDK ships no dependencies).
 
-Used by Smithy query sources (OGRL RFC 0007) and by hand-written AWS resources.
+Used by Smithy query sources (Fathom RFC 0007) and by hand-written AWS resources.
 
 https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
 """

@@ -1,13 +1,13 @@
-"""Query sources (OGRL RFC 0006): static validation, the derived schema, and execution."""
+"""Query sources (Fathom RFC 0006): static validation, the derived schema, and execution."""
 
 import json
 import sys
 
 import pytest
 
-from ogrl_integration import Integration, openapi
-from ogrl_integration.http import Request, Response
-from ogrl_integration.testing import Harness, HarnessError
+from fathom_integration import Integration, openapi
+from fathom_integration.http import Request, Response
+from fathom_integration.testing import Harness, HarnessError
 
 DOCUMENT = {
     "openapi": "3.0.3",
@@ -144,7 +144,7 @@ SETTINGS = openapi.Settings(
     base_url="https://{domain}",
     pagination="link",
     read_operations=("searchApps",),
-    authorization="SSWS {API_TOKEN} | Bearer {OGRL_ACCESS_TOKEN}",
+    authorization="SSWS {API_TOKEN} | Bearer {FATHOM_ACCESS_TOKEN}",
 )
 APPS = openapi.Query(
     operation="listApps",
@@ -267,11 +267,11 @@ class Vendor:
 
 @pytest.fixture
 def bundled(tmp_path, monkeypatch):
-    (tmp_path / "_ogrl_openapi.py").write_text(openapi.encode(SETTINGS, DOCUMENT))
+    (tmp_path / "_fathom_openapi.py").write_text(openapi.encode(SETTINGS, DOCUMENT))
     monkeypatch.syspath_prepend(str(tmp_path))
-    sys.modules.pop("_ogrl_openapi", None)
+    sys.modules.pop("_fathom_openapi", None)
     yield
-    sys.modules.pop("_ogrl_openapi", None)
+    sys.modules.pop("_fathom_openapi", None)
 
 
 def query_json(query: openapi.Query) -> dict:
@@ -304,7 +304,7 @@ def test_execute_paginates_projects_and_authenticates(bundled):
 
     app.transport = vendor = Vendor()
     Harness(app).collect(
-        "apps", 1, {"domain": "acme.vendor.test"}, {"OGRL_ACCESS_TOKEN": "ey"}, query=query_json(APPS)
+        "apps", 1, {"domain": "acme.vendor.test"}, {"FATHOM_ACCESS_TOKEN": "ey"}, query=query_json(APPS)
     )
     assert vendor.requests[0].headers["Authorization"] == "Bearer ey"
 
@@ -324,7 +324,7 @@ def test_execute_rechecks_read_only_and_needs_a_description(bundled):
 
 
 def test_without_a_bundled_description_queries_are_refused():
-    sys.modules.pop("_ogrl_openapi", None)
+    sys.modules.pop("_fathom_openapi", None)
     app = Integration("dev.example.plain", "1.0.0")
     with pytest.raises(HarnessError) as caught:
         Harness(app).collect("x", 1, {}, {}, query=query_json(APPS))

@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from ogrl_integration import Http
-from ogrl_integration.http import Response
-from ogrl_integration.testing import Cassette, CassetteMiss
+from fathom_integration import Http
+from fathom_integration.http import Response
+from fathom_integration.testing import Cassette, CassetteMiss
 
 
 class Vendor:

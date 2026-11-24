@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from ogrl_integration.sigv4 import sign
+from fathom_integration.sigv4 import sign
 
 
 def test_aws_documented_example():

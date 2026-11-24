@@ -7,7 +7,7 @@ import sys
 import tarfile
 import zipfile
 
-from ogrl_integration import cli
+from fathom_integration import cli
 
 
 def test_new_package_passes_conformance_and_its_own_tests(tmp_path):
@@ -49,7 +49,7 @@ def test_pack_is_deterministic_and_carries_the_sdk(tmp_path):
         wheel = next(n for n in names if n.startswith("wheels/"))
         data = tar.extractfile(wheel).read()  # type: ignore[union-attr]
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        assert "ogrl_integration/app.py" in zf.namelist()
+        assert "fathom_integration/app.py" in zf.namelist()
 
 
 def test_conformance_from_a_relative_path(tmp_path, monkeypatch):
@@ -81,9 +81,9 @@ def test_run_collect_with_a_query_finds_the_bundled_description(tmp_path, monkey
         manifest.read_text()
         + 'openapi:\n  description: api.json\n  base_url: "https://{base_host}"\n  pagination: none\n'
     )
-    sys.modules.pop("_ogrl_openapi", None)
+    sys.modules.pop("_fathom_openapi", None)
     app = cli.load_app(root, cli.load_manifest(root))
     assert app._openapi() is not None
-    assert "_ogrl_openapi.py" in {p.name for p in cli._package_files(root)}
+    assert "_fathom_openapi.py" in {p.name for p in cli._package_files(root)}
     assert "api.json" in {p.name for p in cli._package_files(root)}
-    sys.modules.pop("_ogrl_openapi", None)
+    sys.modules.pop("_fathom_openapi", None)

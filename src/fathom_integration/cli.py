@@ -1,12 +1,12 @@
-"""`ogrl-integration`: scaffold, run, test, and pack an integration package.
+"""`fathom-integration`: scaffold, run, test, and pack an integration package.
 
-    ogrl-integration new ./acme-directory --id dev.acme.directory --name "Acme Directory"
-    ogrl-integration run ./acme-directory collect users@1 --config domain=acme.example --out users.jsonl
-    ogrl-integration test ./acme-directory
-    ogrl-integration pack ./acme-directory --out dist/
+    fathom-integration new ./acme-directory --id dev.acme.directory --name "Acme Directory"
+    fathom-integration run ./acme-directory collect users@1 --config domain=acme.example --out users.jsonl
+    fathom-integration test ./acme-directory
+    fathom-integration pack ./acme-directory --out dist/
 
 `run`, `test`, and `pack` read manifest.yaml and need the `cli` extra
-(`pip install 'ogrl-integration[cli]'`) for YAML and JSON Schema.
+(`pip install 'fathom-integration[cli]'`) for YAML and JSON Schema.
 """
 
 import argparse
@@ -26,9 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import ogrl_integration
-from ogrl_integration.app import Integration
-from ogrl_integration.testing import Cassette, Harness, HarnessError
+import fathom_integration
+from fathom_integration.app import Integration
+from fathom_integration.testing import Cassette, Harness, HarnessError
 
 INTEGRATION_ID = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)+$")
 SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$")
@@ -40,7 +40,7 @@ def _need(module: str) -> Any:
     try:
         return importlib.import_module(module)
     except ImportError:
-        sys.exit(f"this command needs {module}: pip install 'ogrl-integration[cli]'")
+        sys.exit(f"this command needs {module}: pip install 'fathom-integration[cli]'")
 
 
 def load_manifest(root: Path) -> dict[str, Any]:
@@ -50,7 +50,7 @@ def load_manifest(root: Path) -> dict[str, Any]:
 
 def build_openapi(root: Path, manifest: dict[str, Any] | None = None) -> Path | None:
     """Write the generated description module when the manifest declares `openapi`."""
-    from ogrl_integration import openapi
+    from fathom_integration import openapi
 
     manifest = manifest or load_manifest(root)
     block = manifest.get("openapi")
@@ -69,7 +69,7 @@ def build_openapi(root: Path, manifest: dict[str, Any] | None = None) -> Path | 
 
 def smithy_api(root: Path, manifest: dict[str, Any] | None = None) -> Any:
     """The manifest's `smithy` block with its models, untrimmed; None without one."""
-    from ogrl_integration import smithy
+    from fathom_integration import smithy
 
     block = (manifest or load_manifest(root)).get("smithy")
     if not block:
@@ -79,14 +79,14 @@ def smithy_api(root: Path, manifest: dict[str, Any] | None = None) -> Any:
 
 
 def trimmed_models(api: Any) -> dict[str, dict[str, Any]]:
-    from ogrl_integration import smithy
+    from fathom_integration import smithy
 
     return {name: smithy.trim(api, name) for name in api.models}
 
 
 def build_smithy(root: Path, manifest: dict[str, Any] | None = None) -> Path | None:
     """Write the generated module of trimmed models when the manifest declares `smithy`."""
-    from ogrl_integration import smithy
+    from fathom_integration import smithy
 
     api = smithy_api(root, manifest)
     if api is None:
@@ -96,7 +96,7 @@ def build_smithy(root: Path, manifest: dict[str, Any] | None = None) -> Path | N
     return target
 
 
-GENERATED = ("_ogrl_openapi", "_ogrl_smithy")
+GENERATED = ("_fathom_openapi", "_fathom_smithy")
 
 
 def load_app(root: Path, manifest: dict[str, Any]) -> Integration:
@@ -155,7 +155,7 @@ def _reference(text: str) -> tuple[str, int]:
 
 def _secrets(manifest: dict[str, Any]) -> dict[str, str]:
     """Credentials for a local run come from the environment, by the names the manifest declares."""
-    names = {"OGRL_ACCESS_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
+    names = {"FATHOM_ACCESS_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"}
     for auth in manifest.get("auth", []):
         names |= {f["name"] for f in auth.get("fields", [])}
     return {k: v for k, v in os.environ.items() if k in names}
@@ -219,8 +219,8 @@ def _process(root: Path, manifest: dict[str, Any], lines: list[dict[str, Any]], 
     root = root.resolve()  # the process runs from /, so a relative path would not resolve
     paths = [str(root), *map(str, sorted((root / "wheels").glob("*.whl")))]
     # The SDK this command runs from stands in for a packed wheel during development.
-    paths.append(str(Path(ogrl_integration.__file__).resolve().parents[1]))
-    # As the OGRL host runs it: no writable working directory, no HOME, no bytecode writes.
+    paths.append(str(Path(fathom_integration.__file__).resolve().parents[1]))
+    # As the Fathom host runs it: no writable working directory, no HOME, no bytecode writes.
     env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": os.pathsep.join(paths)}
     process = subprocess.Popen(
         [sys.executable, "-c", f"import {module} as m; m.{function or 'main'}()"],
@@ -361,9 +361,9 @@ def cmd_test(args: argparse.Namespace) -> int:
 
 def sdk_wheel() -> tuple[str, bytes]:
     """A pure-Python wheel of this SDK, built from its installed files (zip-importable)."""
-    source = Path(ogrl_integration.__file__).resolve().parent
-    version = ogrl_integration.__version__
-    dist = f"ogrl_integration-{version}.dist-info"
+    source = Path(fathom_integration.__file__).resolve().parent
+    version = fathom_integration.__version__
+    dist = f"fathom_integration-{version}.dist-info"
     files = sorted(p for p in source.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
     buffer = io.BytesIO()
     records = []
@@ -381,20 +381,20 @@ def sdk_wheel() -> tuple[str, bytes]:
             )
 
         for path in files:
-            add(f"ogrl_integration/{path.relative_to(source).as_posix()}", path.read_bytes())
+            add(f"fathom_integration/{path.relative_to(source).as_posix()}", path.read_bytes())
         add(
             f"{dist}/METADATA",
-            f"Metadata-Version: 2.1\nName: ogrl-integration\nVersion: {version}\n".encode(),
+            f"Metadata-Version: 2.1\nName: fathom-integration\nVersion: {version}\n".encode(),
         )
         add(
             f"{dist}/WHEEL",
-            b"Wheel-Version: 1.0\nGenerator: ogrl-integration\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            b"Wheel-Version: 1.0\nGenerator: fathom-integration\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         )
         record = "\n".join([*records, f"{dist}/RECORD,,"]) + "\n"
         info = zipfile.ZipInfo(f"{dist}/RECORD", date_time=(1980, 1, 1, 0, 0, 0))
         info.external_attr = 0o644 << 16
         wheel.writestr(info, record)
-    return f"ogrl_integration-{version}-py3-none-any.whl", buffer.getvalue()
+    return f"fathom_integration-{version}-py3-none-any.whl", buffer.getvalue()
 
 
 def _package_files(root: Path) -> Iterator[Path]:
@@ -468,9 +468,9 @@ def cmd_pack(args: argparse.Namespace) -> int:
 
 # --- new ---------------------------------------------------------------------------------------
 
-MODULE = '''"""{name}: an OGRL integration (RFC 0005)."""
+MODULE = '''"""{name}: an Fathom integration (RFC 0005)."""
 
-from ogrl_integration import Integration, Subject, fail, pass_
+from fathom_integration import Integration, Subject, fail, pass_
 
 app = Integration("{id}", "0.1.0")
 
@@ -591,7 +591,7 @@ templates: []
     (root / "tests" / f"test_{module}.py").write_text(
         f'''from pathlib import Path
 
-from ogrl_integration.testing import Cassette, Harness
+from fathom_integration.testing import Cassette, Harness
 from {module} import app
 
 CASSETTES = Path(__file__).parent / "cassettes"
@@ -613,7 +613,7 @@ def test_check_names_disabled_items():
     assert out["subjects"] == [{{"kind": "resource", "name": "beta", "external_id": "2"}}]
 '''
     )
-    print(f"created {root}. Next: ogrl-integration test {root}")
+    print(f"created {root}. Next: fathom-integration test {root}")
     return 0
 
 
@@ -629,7 +629,7 @@ def cmd_openapi_build(args: argparse.Namespace) -> int:
 
 
 def cmd_openapi_search(args: argparse.Namespace) -> int:
-    from ogrl_integration import openapi
+    from fathom_integration import openapi
 
     root = Path(args.package).resolve()
     build_openapi(root)
@@ -682,7 +682,7 @@ def cmd_smithy_describe(args: argparse.Namespace) -> int:
 
 
 def cmd_smithy_validate(args: argparse.Namespace) -> int:
-    from ogrl_integration import smithy
+    from fathom_integration import smithy
 
     api = _smithy_or_exit(Path(args.package))
     definition = _need("yaml").safe_load(Path(args.query).read_text())
@@ -698,7 +698,7 @@ def cmd_smithy_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ogrl-integration", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="fathom-integration", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
     new = sub.add_parser("new", help="scaffold a package")
@@ -725,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
 
     api = sub.add_parser("openapi", help="query sources: build the bundled description, or search it")
     api_sub = api.add_subparsers(dest="action", required=True)
-    api_build = api_sub.add_parser("build", help="write _ogrl_openapi.py from the manifest's openapi block")
+    api_build = api_sub.add_parser("build", help="write _fathom_openapi.py from the manifest's openapi block")
     api_build.add_argument("package")
     api_build.set_defaults(func=cmd_openapi_build)
     api_search = api_sub.add_parser("search", help="find read operations by id, path, or summary")
@@ -735,7 +735,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sm = sub.add_parser("smithy", help="query sources over AWS Smithy models (RFC 0007)")
     sm_sub = sm.add_subparsers(dest="action", required=True)
-    sm_build = sm_sub.add_parser("build", help="write _ogrl_smithy.py: the trimmed models")
+    sm_build = sm_sub.add_parser("build", help="write _fathom_smithy.py: the trimmed models")
     sm_build.add_argument("package")
     sm_build.set_defaults(func=cmd_smithy_build)
     sm_search = sm_sub.add_parser("search", help="find queryable operations by name or summary")

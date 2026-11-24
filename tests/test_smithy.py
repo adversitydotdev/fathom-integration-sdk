@@ -1,4 +1,4 @@
-"""Query sources over Smithy models (OGRL RFC 0007): classification, validation, and the wire.
+"""Query sources over Smithy models (Fathom RFC 0007): classification, validation, and the wire.
 
 The models below are minimal excerpts shaped like `aws/api-models-aws`; the fake AWS
 answers with bodies shaped like the real services' responses.
@@ -11,9 +11,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
-from ogrl_integration import Integration, smithy
-from ogrl_integration.http import Request, Response
-from ogrl_integration.testing import Harness, HarnessError
+from fathom_integration import Integration, smithy
+from fathom_integration.http import Request, Response
+from fathom_integration.testing import Harness, HarnessError
 
 
 def structure(members: dict, **traits) -> dict:
@@ -703,11 +703,11 @@ class FakeAws:
 @pytest.fixture
 def bundled(tmp_path, monkeypatch, api):
     trimmed = {name: smithy.trim(api, name) for name in MODELS}
-    (tmp_path / "_ogrl_smithy.py").write_text(smithy.encode(SETTINGS, trimmed))
+    (tmp_path / "_fathom_smithy.py").write_text(smithy.encode(SETTINGS, trimmed))
     monkeypatch.syspath_prepend(str(tmp_path))
-    sys.modules.pop("_ogrl_smithy", None)
+    sys.modules.pop("_fathom_smithy", None)
     yield
-    sys.modules.pop("_ogrl_smithy", None)
+    sys.modules.pop("_fathom_smithy", None)
 
 
 def collect(query: smithy.Query, config=None, aws=None, **extra):
@@ -852,7 +852,7 @@ def test_max_items_stops_before_the_next_page(bundled):
 
 
 def test_throttling_is_retried():
-    from ogrl_integration.http import Http
+    from fathom_integration.http import Http
 
     class Throttled:
         calls = 0

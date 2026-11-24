@@ -1,7 +1,7 @@
 [project]
-name = "ogrl-integration"
-version = "0.1.0a12"
-description = "Write OGRL integrations: the protocol, an HTTP client, a test kit, and packaging (RFC 0005)."
+name = "fathom-integration"
+version = "0.1.0a13"
+description = "Write Fathom integrations: the protocol, an HTTP client, a test kit, and packaging (RFC 0005)."
 license = "Apache-2.0"
 authors = [
     { name = "David Hoenisch", email = "dh1689@pm.me" }
@@ -13,7 +13,7 @@ dependencies = []
 cli = ["pyyaml>=6", "jsonschema>=4.23"]
 
 [project.scripts]
-ogrl-integration = "ogrl_integration.cli:main"
+fathom-integration = "fathom_integration.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

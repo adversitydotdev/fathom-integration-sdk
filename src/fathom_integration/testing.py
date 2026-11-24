@@ -1,7 +1,7 @@
 """Test kit: drive an integration through the real protocol, offline.
 
 - `Harness(app)` runs operations in process over the same JSON-RPC framing
-  the OGRL host uses, and returns what the host would receive.
+  the Fathom host uses, and returns what the host would receive.
 - `Cassette` records vendor HTTP traffic once (with credentials scrubbed) and
   replays it, so tests never call a real vendor.
 
@@ -22,8 +22,8 @@ from typing import Any, Literal
 from unittest import mock
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ogrl_integration.app import Integration
-from ogrl_integration.http import Request, Response, Transport, UrllibTransport
+from fathom_integration.app import Integration
+from fathom_integration.http import Request, Response, Transport, UrllibTransport
 
 SCRUB_HEADERS = frozenset({"authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"})
 SCRUB_PARAMS = frozenset({"access_token", "token", "api_key", "apikey", "key", "client_secret", "code"})

@@ -17,8 +17,8 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ogrl_integration import __version__
-from ogrl_integration.errors import (
+from fathom_integration import __version__
+from fathom_integration.errors import (
     AuthFailed,
     IntegrationError,
     PermissionDenied,
@@ -129,7 +129,7 @@ class Http:
         self.retries = retries
         self.timeout = timeout
         self._sleep = sleep
-        self.headers = {"User-Agent": f"ogrl-integration/{__version__}", **(headers or {})}
+        self.headers = {"User-Agent": f"fathom-integration/{__version__}", **(headers or {})}
 
     def request(
         self,

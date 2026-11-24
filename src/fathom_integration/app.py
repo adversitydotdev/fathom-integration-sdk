@@ -14,7 +14,7 @@
     if __name__ == "__main__":
         app.run()
 
-`id` and `version` must equal the manifest; `ogrl-integration test` checks.
+`id` and `version` must equal the manifest; `fathom-integration test` checks.
 
 Nothing here touches the filesystem: collected items stream to the host as
 `items` notifications and snapshots arrive inside the `check` request, so a
@@ -30,9 +30,9 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import IO, Any
 
-from ogrl_integration.errors import Incomplete, IntegrationError, InvalidConfig, RateLimited
-from ogrl_integration.http import Http, Transport
-from ogrl_integration.outcomes import Identity, Outcome
+from fathom_integration.errors import Incomplete, IntegrationError, InvalidConfig, RateLimited
+from fathom_integration.http import Http, Transport
+from fathom_integration.outcomes import Identity, Outcome
 
 PROTOCOL = 1
 METHOD_NOT_FOUND = -32601
@@ -87,7 +87,7 @@ class Context:
     @property
     def access_token(self) -> str:
         """For `oauth2` connections: a fresh token the host obtained."""
-        return self.secret("OGRL_ACCESS_TOKEN")
+        return self.secret("FATHOM_ACCESS_TOKEN")
 
     @property
     def aws_credentials(self) -> dict[str, str]:
@@ -222,30 +222,30 @@ class Integration:
 
     def _openapi(self) -> Any:
         if not hasattr(self, "_bundled"):
-            from ogrl_integration import openapi
+            from fathom_integration import openapi
 
             self._bundled = openapi.load_bundled()
         return self._bundled
 
     def _smithy(self) -> Any:
         if not hasattr(self, "_bundled_smithy"):
-            from ogrl_integration import smithy
+            from fathom_integration import smithy
 
             self._bundled_smithy = smithy.load_bundled()
         return self._bundled_smithy
 
     def _query(self, spec: Mapping[str, Any]) -> Resource:
-        """A query source (OGRL RFC 0006 over OpenAPI, RFC 0007 over Smithy)."""
+        """A query source (Fathom RFC 0006 over OpenAPI, RFC 0007 over Smithy)."""
         api = self._smithy()
         if api is not None:
-            from ogrl_integration import smithy
+            from fathom_integration import smithy
 
             query = smithy.Query.from_json(spec)
             return lambda ctx: smithy.execute(ctx, api, query)
         bundled = self._openapi()
         if bundled is None:
             raise InvalidConfig("this integration does not support query sources")
-        from ogrl_integration import openapi
+        from fathom_integration import openapi
 
         settings, description = bundled
         plain = openapi.Query.from_json(spec)

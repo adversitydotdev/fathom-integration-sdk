@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from ogrl_integration import (
+from fathom_integration import (
     Incomplete,
     Integration,
     PermissionDenied,
@@ -14,7 +14,7 @@ from ogrl_integration import (
     fail,
     pass_,
 )
-from ogrl_integration.testing import Harness, HarnessError
+from fathom_integration.testing import Harness, HarnessError
 
 app = Integration("dev.example.test", "1.2.3")
 
